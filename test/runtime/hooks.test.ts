@@ -56,10 +56,18 @@ const apiError = (message: string, statusCode?: number) => ({
 	data: statusCode === undefined ? { message, isRetryable: false } : { message, statusCode, isRetryable: false }
 })
 
+/** The verbatim work-subscription error opencode retries forever (T0 spike, opencode 1.18.34). */
+const GLOBAL_REGIONS =
+	"Upstream request failed: This Go model requires Global regions. Select Global in your workspace's Privacy settings to use it."
+
 type Fixture = {
 	hooks: Hooks
 	logCalls: LogBody[]
 	prompts: PromptCall[]
+	/** Session ids passed to `client.session.abort`, in call order. */
+	aborts: string[]
+	/** Order of resend/abort calls: `prompt:<sessionID>` and `abort:<sessionID>`. */
+	trace: string[]
 	releasePrompts: () => void
 	/** Release one deferred prompt by its index in `prompts`, so completions can be reordered. */
 	releasePrompt: (promptIndex: number) => void
@@ -73,13 +81,18 @@ async function makeHooks(
 		sessionErrorGraceMs?: number
 		rejectPrompt?: boolean
 		rejectLog?: boolean
+		rejectAbort?: boolean
 		deferPrompt?: boolean
+		/** Injectable clock for the pool-cooldown tracker (tests). */
+		now?: () => number
 	} = {}
 ): Promise<Fixture> {
 	const configJson =
 		options.configJson === undefined ? '{"default":["prov/m1","prov/m2","prov/m3"]}' : options.configJson
 	const logCalls: LogBody[] = []
 	const prompts: PromptCall[] = []
+	const aborts: string[] = []
+	const trace: string[] = []
 	const held: Array<{ promptIndex: number; resolve: () => void }> = []
 	const app: Record<string, unknown> = {}
 	if (options.hasAgentsApi !== false) app.agents = async () => ({ data: options.agentsData ?? [{ name: 'coder' }] })
@@ -93,8 +106,16 @@ async function makeHooks(
 		session: {
 			promptAsync: async (call: PromptCall) => {
 				const promptIndex = prompts.push(call) - 1
+				trace.push(`prompt:${call.path?.id ?? ''}`)
 				if (options.rejectPrompt) throw new Error('prompt transport down')
 				if (options.deferPrompt === true) await new Promise<void>((resolve) => held.push({ promptIndex, resolve }))
+				return {}
+			},
+			abort: async (call: { path?: { id?: string } }) => {
+				if (options.rejectAbort) throw new Error('abort transport down')
+				const id = call.path?.id ?? ''
+				aborts.push(id)
+				trace.push(`abort:${id}`)
 				return {}
 			}
 		}
@@ -109,12 +130,15 @@ async function makeHooks(
 			exists: (path) => path === FAKE_CONFIG_PATH && configJson !== null,
 			read: () => configJson ?? '{}'
 		},
-		sessionErrorGraceMs: options.sessionErrorGraceMs ?? 5
+		sessionErrorGraceMs: options.sessionErrorGraceMs ?? 5,
+		...(options.now === undefined ? {} : { now: options.now })
 	})
 	return {
 		hooks,
 		logCalls,
 		prompts,
+		aborts,
+		trace,
 		releasePrompts: () => held.splice(0).forEach((entry) => entry.resolve()),
 		releasePrompt: (promptIndex: number) => {
 			const at = held.findIndex((entry) => entry.promptIndex === promptIndex)
@@ -205,6 +229,16 @@ function resendMessageID(prompts: PromptCall[], index: number): string {
 	return id
 }
 
+/** A `session.status` retry event: the host announcing it is retrying the live model. */
+function emitRetry(hooks: Hooks, sessionID: string, message: string, attempt = 1): Promise<void> {
+	return hooks.event!({
+		event: {
+			type: 'session.status',
+			properties: { sessionID, status: { type: 'retry', attempt, message, next: 1000 } }
+		}
+	})
+}
+
 async function emitResendEcho(
 	hooks: Hooks,
 	sessionID: string,
@@ -235,8 +269,9 @@ describe('fallback resend', () => {
 	})
 
 	test('sends the chain entry variant when one is defined and omits it otherwise', async () => {
+		// quota cools the whole pool, so this same-pool resend needs quota disabled in the fixture.
 		const { hooks, prompts } = await makeHooks({
-			configJson: '{"agents":{"coder":[{"model":"prov/v1","variant":"high"},"prov/v2"]}}'
+			configJson: '{"agents":{"coder":[{"model":"prov/v1","variant":"high"},"prov/v2"]},"cooldownSeconds":{"quota":0}}'
 		})
 		await captureRequest(hooks, 's1', 'coder', 'prov', 'v1', 'go')
 		await emitFailure(hooks, 's1', 'msg_a', 'prov', 'v1', 'coder', apiError('quota exceeded'), 'high')
@@ -918,5 +953,208 @@ describe('resend echo correlation', () => {
 		await sleep(30)
 		expect(prompts).toHaveLength(3)
 		expect(prompts[2]?.body?.model).toEqual({ providerID: 'prov', modelID: 'm4' })
+	})
+})
+
+describe('pool cooldowns', () => {
+	test('skips every entry of the cooled pool and resends to the next pool', async () => {
+		const { hooks, prompts } = await makeHooks({ configJson: '{"default":["go/a","go/b","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'go', 'a', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'zen', modelID: 'c' })
+	})
+
+	test('honors pool mappings so one provider cools its whole mapped pool', async () => {
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"default":["opencode-go/a","zen/b","other/c"],"pools":{"opencode-go":"opencode","zen":"opencode"}}'
+		})
+		await captureRequest(hooks, 's1', 'coder', 'opencode-go', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'opencode-go', 'a', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'other', modelID: 'c' })
+	})
+
+	test('a pool cooled by one session stays cooled for another session', async () => {
+		const { hooks, prompts } = await makeHooks({ configJson: '{"default":["go/a","go/b","zen/c"]}' })
+		// Session 1 cools pool "go" and resends to zen/c.
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'go', 'a', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'zen', modelID: 'c' })
+
+		// Session 2 fails in the same pool: go/b must still be skipped, so zen/c wins again.
+		await captureRequest(hooks, 's2', 'coder', 'go', 'a')
+		await emitFailure(hooks, 's2', 'msg_b', 'go', 'a', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'zen', modelID: 'c' })
+	})
+
+	test('expires a pool cooldown once the configured duration passes', async () => {
+		const clock = { value: 1_000_000 }
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"default":["go/a","zen/x","go/b"]}',
+			now: () => clock.value
+		})
+		// Session 1 cools pool "go" (deadline 1_000_000 + 21_600_000) and resends to zen/x.
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'go', 'a', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'zen', modelID: 'x' })
+
+		// Session 2 runs zen/x: go/b is still cooling, so nothing is left to try.
+		await captureRequest(hooks, 's2', 'coder', 'zen', 'x')
+		await emitFailure(hooks, 's2', 'msg_b', 'zen', 'x', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(1)
+
+		// Step one millisecond past the go deadline.
+		clock.value += 21_600_001
+
+		// Session 3: pool "go" is eligible again, so go/b must be selectable.
+		await captureRequest(hooks, 's3', 'coder', 'zen', 'x')
+		await emitFailure(hooks, 's3', 'msg_c', 'zen', 'x', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'go', modelID: 'b' })
+	})
+
+	test('logs once when every remaining entry is cooling down', async () => {
+		const { hooks, prompts, logCalls } = await makeHooks({ configJson: '{"default":["go/a","go/b"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'go', 'a', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(0)
+
+		// A second distinct failure of the same request must not log again.
+		await emitFailure(hooks, 's1', 'msg_b', 'go', 'b', 'coder', apiError(GLOBAL_REGIONS))
+		expect(prompts).toHaveLength(0)
+		const cooling = logCalls.filter((body) => String(body.message).includes('cooling'))
+		expect(cooling).toHaveLength(1)
+		expect(cooling[0]?.level).toBe('warn')
+	})
+})
+
+describe('session.status retries', () => {
+	test('aborts the stuck retry and resends to the next pool when the pool is unavailable', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({ configJson: '{"default":["go/a","go/b","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'zen', modelID: 'c' })
+	})
+
+	test('stops the host retry loop before the resend is issued', async () => {
+		const { hooks, trace } = await makeHooks({ configJson: '{"default":["go/a","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		expect(trace).toEqual(['abort:s1', 'prompt:s1'])
+	})
+
+	test('acts only once when the host keeps reporting the same retry', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({ configJson: '{"default":["go/a","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS, 1)
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS, 2)
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS, 3)
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(1)
+	})
+
+	test('aborts without a resend when every remaining entry is cooling down', async () => {
+		const { hooks, prompts, aborts, logCalls } = await makeHooks({ configJson: '{"default":["go/a","go/b"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(0)
+		const cooling = logCalls.filter((body) => String(body.message).includes('cooling'))
+		expect(cooling).toHaveLength(1)
+		expect(cooling[0]?.level).toBe('warn')
+	})
+
+	test('does not abort a rate-limited retry when the chain has no next entry', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({ configJson: '{"default":["prov/m1"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'm1')
+		await emitRetry(hooks, 's1', 'rate limit exceeded')
+		expect(aborts).toHaveLength(0)
+		expect(prompts).toHaveLength(0)
+	})
+
+	test('ignores retries while the plugin is disabled', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({ configJson: '{"enabled":false,"default":["go/a","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		expect(aborts).toHaveLength(0)
+		expect(prompts).toHaveLength(0)
+	})
+
+	test('the abort follow-up MessageAbortedError does not trigger another fallback', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({ configJson: '{"default":["go/a","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(1)
+
+		// The aborted generation surfaces as a session.error follow-up: no extra abort or resend.
+		await hooks.event!({
+			event: {
+				type: 'session.error',
+				properties: { sessionID: 's1', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } }
+			}
+		})
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(1)
+	})
+})
+
+describe('cooldown scope by error kind', () => {
+	test('a rate-limited model cools alone: resend stays in the pool and a second session skips only that model', async () => {
+		const { hooks, prompts } = await makeHooks({ configJson: '{"default":["prov/a","prov/b"]}' })
+		// Session 1: prov/a is rate-limited; its pool-mate prov/b must take over.
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'prov', 'a', 'coder', apiError('rate limit', 429))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'prov', modelID: 'b' })
+
+		// Session 2: a fresh chain walk from the top: prov/a still cools (shared tracker),
+		// prov/b of the same pool stays eligible.
+		await captureRequest(hooks, 's2', 'coder', 'other', 'z')
+		await emitFailure(hooks, 's2', 'msg_b', 'other', 'z', 'coder', apiError('rate limit', 429))
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'prov', modelID: 'b' })
+	})
+
+	test('a quota failure cools the whole pool: go/b is skipped in favor of zen/c', async () => {
+		const { hooks, prompts } = await makeHooks({ configJson: '{"default":["go/a","go/b","zen/c"]}' })
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'go', 'a', 'coder', apiError('quota exceeded'))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'zen', modelID: 'c' })
+	})
+
+	test('a model cooldown expires on its own while the pool stays usable', async () => {
+		const clock = { value: 1_000_000 }
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"default":["prov/a","other/x"],"cooldownSeconds":{"rateLimit":60}}',
+			now: () => clock.value
+		})
+		// Session 1: rate-limited prov/a cools only that model; other/x takes over.
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'a')
+		await emitFailure(hooks, 's1', 'msg_a', 'prov', 'a', 'coder', apiError('rate limit', 429))
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'other', modelID: 'x' })
+
+		// Session 2: prov/a still cooling (deadline 1_060_000), other/x eligible again.
+		await captureRequest(hooks, 's2', 'coder', 'other', 'z')
+		await emitFailure(hooks, 's2', 'msg_b', 'other', 'z', 'coder', apiError('rate limit', 429))
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'other', modelID: 'x' })
+
+		// Step one millisecond past the model deadline.
+		clock.value += 60_001
+
+		// Session 3: prov/a is eligible again, so the walk starts with it.
+		await captureRequest(hooks, 's3', 'coder', 'other', 'z')
+		await emitFailure(hooks, 's3', 'msg_c', 'other', 'z', 'coder', apiError('rate limit', 429))
+		expect(prompts).toHaveLength(3)
+		expect(prompts[2]?.body?.model).toEqual({ providerID: 'prov', modelID: 'a' })
 	})
 })

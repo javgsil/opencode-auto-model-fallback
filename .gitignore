@@ -3,3 +3,4 @@ dist/
 spike/*.jsonl
 spike/*.log
 spike/run-*
+.atl/

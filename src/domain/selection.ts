@@ -28,18 +28,29 @@ function sameEntry(a: ChainEntry, b: ChainEntry): boolean {
 }
 
 /**
+ * Optional availability check for a candidate entry, e.g. "its pool is not
+ * cooling down". Returning `false` skips the entry as if it had been attempted.
+ */
+export type Availability = (entry: ChainEntry) => boolean
+
+/**
  * Next chain entry to try, or `null` when the chain is exhausted.
  *
  * Rules (deterministic, order-preserving):
  * - never an entry identical (model + variant) to the failing one;
  * - never an entry already attempted for this request;
+ * - never an entry the availability predicate rejects;
  * - when the failing identity sits in the chain, continue after its position;
  * - otherwise start from the beginning of the chain.
+ *
+ * The predicate defaults to "every entry is available", so callers without
+ * availability concerns keep the original behavior.
  */
 export function selectNextEntry(
 	chain: readonly ChainEntry[],
 	failing: FailingIdentity,
-	attempted: readonly ChainEntry[]
+	attempted: readonly ChainEntry[],
+	isAvailable: Availability = () => true
 ): ChainEntry | null {
 	const failingIndex = chain.findIndex((entry) => sameIdentity(entry, failing))
 	const start = failingIndex === -1 ? 0 : failingIndex + 1
@@ -48,6 +59,7 @@ export function selectNextEntry(
 		if (entry === undefined) continue
 		if (sameIdentity(entry, failing)) continue
 		if (attempted.some((attempt) => sameEntry(attempt, entry))) continue
+		if (!isAvailable(entry)) continue
 		return entry
 	}
 	return null

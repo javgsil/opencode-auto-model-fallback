@@ -67,4 +67,39 @@ describe('selectNextEntry', () => {
 		expect(chain).toEqual([M1, M2])
 		expect(attempted).toEqual([M1])
 	})
+
+	test('skips entries the availability predicate rejects', () => {
+		const chain = [M1, M2, M3]
+		expect(selectNextEntry(chain, failing('prov', 'm1'), [], (entry) => entry !== M2)).toEqual(M3)
+		expect(selectNextEntry(chain, failing('prov', 'm1'), [], (entry) => entry !== M2 && entry !== M3)).toBeNull()
+	})
+
+	test('offers candidates to the predicate in chain order until one is available', () => {
+		const seen: ChainEntry[] = []
+		const next = selectNextEntry([M1, M2, M3], failing('prov', 'm1'), [], (entry) => {
+			seen.push(entry)
+			return entry === M3
+		})
+		// M2 is rejected first, so the predicate runs again for M3; evaluation stops there.
+		expect(seen).toEqual([M2, M3])
+		expect(next).toEqual(M3)
+	})
+
+	test('the position and attempted rules still win when a predicate is given', () => {
+		const chain = [M1, M2, M3]
+		// M1 is available but sits before the failing entry's position; M3 is rejected.
+		expect(selectNextEntry(chain, failing('prov', 'm2'), [M1], (entry) => entry !== M3)).toBeNull()
+	})
+
+	test('behaves identically to the no-predicate form when everything is available', () => {
+		const chain = [M1, M2, M3]
+		const all = (entry: ChainEntry): boolean => {
+			void entry
+			return true
+		}
+		expect(selectNextEntry(chain, failing('prov', 'm1'), [M1], all)).toEqual(
+			selectNextEntry(chain, failing('prov', 'm1'), [M1])
+		)
+		expect(selectNextEntry([], failing('prov', 'm1'), [], all)).toBeNull()
+	})
 })

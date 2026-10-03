@@ -19,7 +19,8 @@
  */
 
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
-import { chainFor, parseModelRef, type ChainEntry } from '../domain/config'
+import { chainFor, parseModelRef, resolvePool, type ChainEntry } from '../domain/config'
+import { createPoolCooldowns } from '../domain/cooldown'
 import { classifyError } from '../domain/error-classifier'
 import { selectNextEntry, type FailingIdentity } from '../domain/selection'
 import { fetchKnownAgents, knownAgentsFromConfig, unknownAgentNames } from './agents'
@@ -58,6 +59,8 @@ export type RuntimeDeps = {
 	configLoader?: Omit<ConfigLoaderDeps, 'projectDirectory'>
 	/** Override the session.error grace period (tests). */
 	sessionErrorGraceMs?: number
+	/** Override the pool-cooldown clock (tests). */
+	now?: () => number
 }
 
 type Failure = {
@@ -232,6 +235,16 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 	const sessions = new Map<string, SessionState>()
 	let disposed = false
 	const graceMs = deps.sessionErrorGraceMs ?? DEFAULT_SESSION_ERROR_GRACE_MS
+	// One cooldown tracker for the whole plugin: a pool cooled by one session is skipped
+	// by every later selection, in any session, until the clock passes its deadline.
+	const cooldowns = createPoolCooldowns(config.cooldownSeconds, deps.now ?? Date.now)
+
+	/** Whether a chain entry may run now: neither its pool nor its model may be cooling down. */
+	const entryAvailable = (entry: ChainEntry): boolean => {
+		const ref = parseModelRef(entry.model)
+		if (ref === null) return true
+		return !cooldowns.isCooling({ pool: resolvePool(ref.providerID, config.pools), model: entry.model })
+	}
 
 	const getState = (sessionID: string): SessionState => {
 		let state = sessions.get(sessionID)
@@ -261,51 +274,29 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 		}
 	}
 
-	/** Shared failure handling for `message.updated` and delayed `session.error`. */
-	const processFailure = async (sessionID: string, failure: Failure): Promise<void> => {
-		if (!config.enabled) return
-		const state = getState(sessionID)
-		if (failure.messageID !== undefined) {
-			if (state.handled.has(failure.messageID)) return
-			state.handled.add(failure.messageID)
+	/**
+	 * One exhaustion log per request. Without the availability filter a reachable
+	 * entry still exists, so only the cooldown hides it: say that instead of
+	 * claiming the chain is done.
+	 */
+	const logExhausted = (
+		sessionID: string,
+		agent: string,
+		state: SessionState,
+		chain: readonly ChainEntry[],
+		failing: FailingIdentity
+	): void => {
+		if (state.exhaustedLogged) return
+		state.exhaustedLogged = true
+		if (selectNextEntry(chain, failing, state.attempted) !== null) {
+			logger.warn(`fallback chain for agent "${agent}" in session ${sessionID}: every remaining entry is cooling down`)
+		} else {
+			logger.warn(`fallback chain exhausted for agent "${agent}" in session ${sessionID}`)
 		}
-		state.lastFailureAt = Date.now()
-		state.lastFailureIdentity = {
-			agent: failure.agent,
-			providerID: failure.providerID,
-			modelID: failure.modelID,
-			variant: failure.variant
-		}
+	}
 
-		const details = errorDetails(failure.error)
-		if (classifyError({ message: details.message, statusCode: details.statusCode }).kind === 'not-fallback') return
-
-		const { agent, providerID, modelID, variant } = failure
-		if (agent === undefined || providerID === undefined || modelID === undefined) return
-
-		const failing: FailingIdentity = { providerID, modelID, ...(variant === undefined ? {} : { variant }) }
-		const failingEntry = identityEntry(failing)
-		if (state.failed.some((entry) => sameEntry(entry, failingEntry))) return
-		state.failed.push(failingEntry)
-		state.attempted.push(failingEntry)
-
-		if (state.parts.length === 0) {
-			logger.warn(`no user message parts captured for session ${sessionID}; skipping fallback`)
-			return
-		}
-
-		const chain = chainFor(agent, config)
-		if (chain.length === 0) return
-
-		const next = selectNextEntry(chain, failing, state.attempted)
-		if (next === null) {
-			if (!state.exhaustedLogged) {
-				state.exhaustedLogged = true
-				logger.warn(`fallback chain exhausted for agent "${agent}" in session ${sessionID}`)
-			}
-			return
-		}
-
+	/** Walk one step further along the chain: send the original parts with `next`'s model. */
+	const resendNext = async (sessionID: string, state: SessionState, agent: string, next: ChainEntry): Promise<void> => {
 		const target = parseModelRef(next.model)
 		if (target === null) return
 
@@ -348,6 +339,67 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 			state.resendIDs.delete(resendID)
 			logger.error(`resend failed for session ${sessionID}: ${describeError(error)}`)
 		}
+	}
+
+	/** Stop the host's own retry loop for `sessionID`; never throws. Returns whether it worked. */
+	const abortSession = async (sessionID: string): Promise<boolean> => {
+		try {
+			await client.session.abort({ path: { id: sessionID } })
+			return true
+		} catch (error) {
+			logger.error(`abort failed for session ${sessionID}: ${describeError(error)}`)
+			return false
+		}
+	}
+
+	/** Shared failure handling for `message.updated` and delayed `session.error`. */
+	const processFailure = async (sessionID: string, failure: Failure): Promise<void> => {
+		if (!config.enabled) return
+		const state = getState(sessionID)
+		if (failure.messageID !== undefined) {
+			if (state.handled.has(failure.messageID)) return
+			state.handled.add(failure.messageID)
+		}
+		state.lastFailureAt = Date.now()
+		state.lastFailureIdentity = {
+			agent: failure.agent,
+			providerID: failure.providerID,
+			modelID: failure.modelID,
+			variant: failure.variant
+		}
+
+		const details = errorDetails(failure.error)
+		const kind = classifyError({ message: details.message, statusCode: details.statusCode }).kind
+		if (kind === 'not-fallback') return
+
+		const { agent, providerID, modelID, variant } = failure
+		if (agent === undefined || providerID === undefined || modelID === undefined) return
+
+		const failing: FailingIdentity = { providerID, modelID, ...(variant === undefined ? {} : { variant }) }
+		const failingEntry = identityEntry(failing)
+		if (state.failed.some((entry) => sameEntry(entry, failingEntry))) return
+		state.failed.push(failingEntry)
+		state.attempted.push(failingEntry)
+		// The failure cools its scope (pool or model, per kind) BEFORE selection: this
+		// selection already skips that scope, and so does every later one until the
+		// configured duration passes.
+		cooldowns.mark(kind, { pool: resolvePool(providerID, config.pools), model: failingEntry.model })
+
+		if (state.parts.length === 0) {
+			logger.warn(`no user message parts captured for session ${sessionID}; skipping fallback`)
+			return
+		}
+
+		const chain = chainFor(agent, config)
+		if (chain.length === 0) return
+
+		const next = selectNextEntry(chain, failing, state.attempted, entryAvailable)
+		if (next === null) {
+			logExhausted(sessionID, agent, state, chain, failing)
+			return
+		}
+
+		await resendNext(sessionID, state, agent, next)
 	}
 
 	const hooks: Hooks = {
@@ -454,6 +506,47 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 						if (!sameIdentity(state.identity, snapshot)) return
 						void processFailure(sessionID, snapshot)
 					}, graceMs)
+				} else if (event.type === 'session.status') {
+					const { sessionID, status } = event.properties
+					if (status.type !== 'retry') return
+					if (!config.enabled) return
+					const state = getState(sessionID)
+					// While this plugin's own resend is still settling, host retries still describe
+					// the run we just aborted: acting on them would abort the fresh generation.
+					if (state.pendingResend) return
+					const kind = classifyError({ message: status.message }).kind
+					if (kind === 'not-fallback') return
+					const { agent, providerID, modelID, variant } = state.identity
+					if (agent === undefined || providerID === undefined || modelID === undefined) return
+					if (state.parts.length === 0) {
+						logger.warn(`no user message parts captured for session ${sessionID}; skipping fallback`)
+						return
+					}
+					const failing: FailingIdentity = { providerID, modelID, ...(variant === undefined ? {} : { variant }) }
+					const failingEntry = identityEntry(failing)
+					if (state.failed.some((entry) => sameEntry(entry, failingEntry))) return
+					state.failed.push(failingEntry)
+					state.attempted.push(failingEntry)
+					// The retry is the same failure a late session.error would carry: keep the
+					// twin suppression aligned with it.
+					state.lastFailureAt = Date.now()
+					state.lastFailureIdentity = { agent, providerID, modelID, variant }
+					cooldowns.mark(kind, { pool: resolvePool(providerID, config.pools), model: failingEntry.model })
+
+					const chain = chainFor(agent, config)
+					if (chain.length === 0) return
+					const next = selectNextEntry(chain, failing, state.attempted, entryAvailable)
+					if (next === null) {
+						logExhausted(sessionID, agent, state, chain, failing)
+						// The host is retrying a pool that is down: stop its loop even though
+						// there is nothing left to fall back to.
+						if (kind === 'pool-unavailable') await abortSession(sessionID)
+						return
+					}
+					// Stop the host's retry loop before our own prompt: two concurrent
+					// generations of one request would race for the session.
+					if (!(await abortSession(sessionID))) return
+					await resendNext(sessionID, state, agent, next)
 				} else if (event.type === 'session.deleted') {
 					const state = sessions.get(event.properties.info.id)
 					if (state !== undefined) {
