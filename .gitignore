@@ -1,0 +1,5 @@
+node_modules/
+dist/
+spike/*.jsonl
+spike/*.log
+spike/run-*
