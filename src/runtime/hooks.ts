@@ -8,7 +8,9 @@
  *   message carrying the id passed to `promptAsync` counts as this plugin's
  *   resend echo, and it only contributes its user message id.
  * - `chat.params` records the model actually being used and clears the resend
- *   marker set by this plugin's own echo.
+ *   marker set by this plugin's own echo, but only when the params answer a
+ *   message of the live request: a late params call for a superseded resend or
+ *   for an older request is ignored.
  * - `message.updated` failures (correlated to the live request through the
  *   assistant message's parent user message) and delayed `session.error` events
  *   walk the chain once per request via `selectNextEntry`, resending the
@@ -532,6 +534,19 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 					state.lastFailureAt = Date.now()
 					state.lastFailureIdentity = { agent, providerID, modelID, variant }
 					cooldowns.mark(kind, { pool: resolvePool(providerID, config.pools), model: failingEntry.model })
+					// The two records above stay provisional until an abort has succeeded. A rejected
+					// abort leaves the host retrying this very identity, so committing it now would make
+					// every later retry and every later failure for it return at the guard above for the
+					// rest of this request. The cooldown and the last-failure markers stay either way:
+					// the failure really was observed, and only twin suppression reads them.
+					const rollbackFailure = (): void => {
+						const drop = (entries: ChainEntry[]): void => {
+							const at = entries.lastIndexOf(failingEntry)
+							if (at !== -1) entries.splice(at, 1)
+						}
+						drop(state.failed)
+						drop(state.attempted)
+					}
 
 					const chain = chainFor(agent, config)
 					if (chain.length === 0) return
@@ -540,12 +555,24 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 						logExhausted(sessionID, agent, state, chain, failing)
 						// The host is retrying a pool that is down: stop its loop even though
 						// there is nothing left to fall back to.
-						if (kind === 'pool-unavailable') await abortSession(sessionID)
+						if (kind === 'pool-unavailable' && !(await abortSession(sessionID))) rollbackFailure()
 						return
 					}
 					// Stop the host's retry loop before our own prompt: two concurrent
 					// generations of one request would race for the session.
-					if (!(await abortSession(sessionID))) return
+					// The request identity is captured BEFORE the abort: while that call
+					// is in flight a genuine `chat.message` may supersede this request and
+					// replace `state.parts`, so resending afterwards would push the NEW
+					// request's parts with a chain entry selected for the OLD one.
+					const requestSeq = state.requestSeq
+					if (!(await abortSession(sessionID))) {
+						rollbackFailure()
+						return
+					}
+					if (state.requestSeq !== requestSeq) {
+						rollbackFailure()
+						return
+					}
 					await resendNext(sessionID, state, agent, next)
 				} else if (event.type === 'session.deleted') {
 					const state = sessions.get(event.properties.info.id)
@@ -598,6 +625,15 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 		'chat.params': async (input: ChatParamsInput) => {
 			try {
 				const state = getState(input.sessionID)
+				// Correlate the params with the request they answer: `chat.params` carries the
+				// live user message, so it applies only when that message belongs to the current
+				// request (its genuine id or one of this request's own resend echoes). A late
+				// params call for a superseded resend or for an older request must neither
+				// overwrite the identity of a newer genuine request nor release the marker that
+				// keeps `session.error` quiet while our resend settles. Without a usable id the
+				// correlation is impossible, so the previous unconditional behavior stands.
+				const answered = readString(input.message, 'id')
+				if (answered !== undefined && answered.length > 0 && !state.requestUserIDs.has(answered)) return
 				state.identity.agent = input.agent
 				state.identity.providerID = input.model.providerID
 				state.identity.modelID = modelIDFor(input.model.providerID, input.model.id)

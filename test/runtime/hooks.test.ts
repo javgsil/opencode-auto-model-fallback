@@ -33,13 +33,20 @@ function textPart(sessionID: string, text: string): ChatMessageOutput['parts'][n
 	return { id: `part_${text}`, sessionID, messageID: `msg_user_${sessionID}`, type: 'text', text }
 }
 
-function paramsInput(sessionID: string, agent: string, providerID: string, modelID: string): ChatParamsInput {
+function paramsInput(
+	sessionID: string,
+	agent: string,
+	providerID: string,
+	modelID: string,
+	/** Id of the user message these params answer; defaults to the session's genuine one. */
+	messageID?: string
+): ChatParamsInput {
 	return {
 		sessionID,
 		agent,
 		model: { providerID, id: modelID } as unknown as ChatParamsInput['model'],
 		provider: { source: 'config', info: {}, options: {} } as unknown as ChatParamsInput['provider'],
-		message: userMessage(sessionID)
+		message: userMessage(sessionID, messageID)
 	}
 }
 
@@ -71,6 +78,8 @@ type Fixture = {
 	releasePrompts: () => void
 	/** Release one deferred prompt by its index in `prompts`, so completions can be reordered. */
 	releasePrompt: (promptIndex: number) => void
+	/** Release every `session.abort` call currently held by `deferAbortTimes`. */
+	releaseAborts: () => void
 }
 
 async function makeHooks(
@@ -81,10 +90,18 @@ async function makeHooks(
 		sessionErrorGraceMs?: number
 		rejectPrompt?: boolean
 		rejectLog?: boolean
+		/** Reject every `session.abort` call. */
 		rejectAbort?: boolean
+		/** Reject only this many of the first `session.abort` calls. */
+		rejectAbortTimes?: number
+		/** Hold only this many of the first `session.abort` calls until `releaseAborts` runs. */
+		deferAbortTimes?: number
 		deferPrompt?: boolean
 		/** Injectable clock for the pool-cooldown tracker (tests). */
 		now?: () => number
+		/** Payload of `session.status` / `session.messages` for the task-guard wiring test. */
+		sessionStatusData?: unknown
+		sessionMessagesData?: unknown
 	} = {}
 ): Promise<Fixture> {
 	const configJson =
@@ -94,6 +111,12 @@ async function makeHooks(
 	const aborts: string[] = []
 	const trace: string[] = []
 	const held: Array<{ promptIndex: number; resolve: () => void }> = []
+	/** Resolvers of `session.abort` calls held back by `deferAbortTimes`. */
+	const heldAborts: Array<() => void> = []
+	// How many of the first `session.abort` calls must reject; `rejectAbort` means all of them.
+	let abortsToReject = options.rejectAbortTimes ?? 0
+	if (options.rejectAbort === true) abortsToReject = Number.POSITIVE_INFINITY
+	let abortsToDefer = options.deferAbortTimes ?? 0
 	const app: Record<string, unknown> = {}
 	if (options.hasAgentsApi !== false) app.agents = async () => ({ data: options.agentsData ?? [{ name: 'coder' }] })
 	app.log = async (call: { body?: LogBody }) => {
@@ -112,12 +135,23 @@ async function makeHooks(
 				return {}
 			},
 			abort: async (call: { path?: { id?: string } }) => {
-				if (options.rejectAbort) throw new Error('abort transport down')
 				const id = call.path?.id ?? ''
+				// The attempt is recorded even when it rejects: the tests assert how often the
+				// handler tried to stop the host loop, not only how often that call succeeded.
 				aborts.push(id)
 				trace.push(`abort:${id}`)
+				if (abortsToReject > 0) {
+					abortsToReject -= 1
+					throw new Error('abort transport down')
+				}
+				if (abortsToDefer > 0) {
+					abortsToDefer -= 1
+					await new Promise<void>((resolve) => heldAborts.push(resolve))
+				}
 				return {}
-			}
+			},
+			status: async () => ({ data: options.sessionStatusData ?? {} }),
+			messages: async () => ({ data: options.sessionMessagesData ?? [] })
 		}
 	} as unknown as Client
 
@@ -145,7 +179,8 @@ async function makeHooks(
 			if (at === -1) throw new Error(`prompt ${promptIndex} is not held`)
 			const [entry] = held.splice(at, 1)
 			entry?.resolve()
-		}
+		},
+		releaseAborts: () => heldAborts.splice(0).forEach((resolve) => resolve())
 	}
 }
 
@@ -954,6 +989,83 @@ describe('resend echo correlation', () => {
 		expect(prompts).toHaveLength(3)
 		expect(prompts[2]?.body?.model).toEqual({ providerID: 'prov', modelID: 'm4' })
 	})
+
+	test('late params from a superseded resend do not overwrite the live request identity', async () => {
+		const { hooks, prompts } = await makeHooks()
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'm1', 'first')
+		await emitFailure(hooks, 's1', 'msg_a', 'prov', 'm1', 'coder', apiError('rate limit', 429))
+		expect(prompts).toHaveLength(1)
+		const staleEcho = resendMessageID(prompts, 0)
+
+		// A new genuine request takes over while that resend's echo is still outstanding.
+		await hooks['chat.message']!(
+			{ sessionID: 's1', agent: 'coder' },
+			{ message: userMessage('s1', 'msg_u2'), parts: [textPart('s1', 'second')] }
+		)
+		await hooks['chat.params']!(paramsInput('s1', 'coder', 'prov', 'm1', 'msg_u2'), paramsOutput())
+
+		// The superseded resend's echo and its params arrive late: the resend's model
+		// must not win over the identity the live request just recorded.
+		await emitResendEcho(hooks, 's1', prompts, 0, 'first')
+		await hooks['chat.params']!(paramsInput('s1', 'coder', 'prov', 'm2', staleEcho), paramsOutput())
+
+		// Evidence that the live request really produced output on prov/m1...
+		await emitAssistantUpdate(hooks, 's1', 'msg_ok', 'prov', 'm1', 'msg_u2')
+		await sleep(150)
+
+		// ...so this session-only failure belongs to prov/m1 of request 2 and walks
+		// request 2's chain from its own start, not the superseded resend's position.
+		await hooks.event!({
+			event: {
+				type: 'session.error',
+				properties: {
+					sessionID: 's1',
+					error: { name: 'APIError', data: { message: 'rate limit', statusCode: 429, isRetryable: true } }
+				}
+			}
+		})
+		await sleep(30)
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'prov', modelID: 'm2' })
+		expect(prompts[1]?.body?.parts).toEqual([{ type: 'text', text: 'second' }])
+	})
+
+	test('late params from an older request do not release a pending resend marker', async () => {
+		const { hooks, prompts } = await makeHooks()
+		// Request 1 runs prov/m2 and its params answer its own user message.
+		await hooks['chat.message']!(
+			{ sessionID: 's1', agent: 'coder' },
+			{ message: userMessage('s1', 'msg_u1'), parts: [textPart('s1', 'first')] }
+		)
+		await hooks['chat.params']!(paramsInput('s1', 'coder', 'prov', 'm2', 'msg_u1'), paramsOutput())
+
+		// Request 2 takes over on prov/m1 and fails: its resend to prov/m2 is outstanding.
+		await hooks['chat.message']!(
+			{ sessionID: 's1', agent: 'coder' },
+			{ message: userMessage('s1', 'msg_u2'), parts: [textPart('s1', 'second')] }
+		)
+		await hooks['chat.params']!(paramsInput('s1', 'coder', 'prov', 'm1', 'msg_u2'), paramsOutput())
+		await emitFailure(hooks, 's1', 'msg_a', 'prov', 'm1', 'coder', apiError('rate limit', 429), undefined, 'msg_u2')
+		expect(prompts).toHaveLength(1)
+
+		// Request 1's params arrive late: they must not release the marker that keeps
+		// `session.error` quiet while this plugin's own resend is still settling.
+		await hooks['chat.params']!(paramsInput('s1', 'coder', 'prov', 'm2', 'msg_u1'), paramsOutput())
+
+		await sleep(150)
+		await hooks.event!({
+			event: {
+				type: 'session.error',
+				properties: {
+					sessionID: 's1',
+					error: { name: 'APIError', data: { message: 'rate limit', statusCode: 429, isRetryable: true } }
+				}
+			}
+		})
+		await sleep(30)
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.parts).toEqual([{ type: 'text', text: 'second' }])
+	})
 })
 
 describe('pool cooldowns', () => {
@@ -1070,6 +1182,29 @@ describe('session.status retries', () => {
 		expect(cooling[0]?.level).toBe('warn')
 	})
 
+	test('a rejected abort does not lock the failing identity out of later retries', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({
+			configJson: '{"default":["prov/m1","prov/m2"]}',
+			rejectAbortTimes: 1
+		})
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'm1')
+
+		// First retry: our abort is rejected, so nothing may be resent yet.
+		await emitRetry(hooks, 's1', 'rate limit exceeded')
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(0)
+
+		// Second retry: the abort succeeds now, so exactly one fallback prompt follows.
+		await emitRetry(hooks, 's1', 'rate limit exceeded', 2)
+		expect(aborts).toEqual(['s1', 's1'])
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'prov', modelID: 'm2' })
+
+		// The resend is still settling, so a third retry must not send a second prompt.
+		await emitRetry(hooks, 's1', 'rate limit exceeded', 3)
+		expect(prompts).toHaveLength(1)
+	})
+
 	test('does not abort a rate-limited retry when the chain has no next entry', async () => {
 		const { hooks, prompts, aborts } = await makeHooks({ configJson: '{"default":["prov/m1"]}' })
 		await captureRequest(hooks, 's1', 'coder', 'prov', 'm1')
@@ -1156,5 +1291,32 @@ describe('cooldown scope by error kind', () => {
 		await emitFailure(hooks, 's3', 'msg_c', 'other', 'z', 'coder', apiError('rate limit', 429))
 		expect(prompts).toHaveLength(3)
 		expect(prompts[2]?.body?.model).toEqual({ providerID: 'prov', modelID: 'a' })
+	})
+})
+
+describe('session.status retry race', () => {
+	test('a genuine request arriving during the abort suppresses the superseded resend', async () => {
+		const { hooks, prompts, aborts, releaseAborts } = await makeHooks({
+			configJson: '{"default":["prov/m1","prov/m2","prov/m3"]}',
+			deferAbortTimes: 1
+		})
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'm1', 'first')
+
+		// The handler parks inside `session.abort`, so `resendNext` has not run yet.
+		const retry = emitRetry(hooks, 's1', 'rate limit exceeded')
+		expect(aborts).toEqual(['s1'])
+
+		// A genuine new request supersedes the old one while that abort is in flight.
+		await captureRequest(hooks, 's1', 'coder', 'prov', 'm1', 'second')
+		releaseAborts()
+		await retry
+		expect(prompts).toHaveLength(0)
+
+		// The new request still owns an intact chain: its own retry resends its own parts.
+		await sleep(150)
+		await emitRetry(hooks, 's1', 'rate limit exceeded')
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.parts).toEqual([{ type: 'text', text: 'second' }])
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'prov', modelID: 'm2' })
 	})
 })
