@@ -1320,3 +1320,66 @@ describe('session.status retry race', () => {
 		expect(prompts[0]?.body?.model).toEqual({ providerID: 'prov', modelID: 'm2' })
 	})
 })
+
+describe('task guard transform wiring', () => {
+	type TransformOutput = Parameters<NonNullable<Hooks['experimental.chat.messages.transform']>>[1]
+
+	const phantomPart = () => ({
+		id: 'prt_1',
+		sessionID: 'ses_parent',
+		messageID: 'msg_1',
+		type: 'tool',
+		callID: 'call_1',
+		tool: 'task',
+		state: {
+			status: 'error',
+			input: { description: 'ping', prompt: 'Reply with exactly: CHILD-OK', subagent_type: 'spike-child' },
+			error: 'Task cancelled',
+			metadata: { parentSessionId: 'ses_parent', sessionId: 'ses_child' },
+			time: { start: 1, end: 2 }
+		}
+	})
+
+	const phantomOutput = (part: ReturnType<typeof phantomPart>): TransformOutput =>
+		({
+			messages: [{ info: { id: 'msg_1', role: 'assistant', sessionID: 'ses_parent' }, parts: [part] }]
+		}) as unknown as TransformOutput
+
+	test('registers the guard when the plugin and the task guard are enabled', async () => {
+		const { hooks } = await makeHooks({ configJson: '{"default":["prov/m1"]}' })
+		expect(typeof hooks['experimental.chat.messages.transform']).toBe('function')
+	})
+
+	test('leaves the guard out when the task guard is disabled', async () => {
+		const { hooks } = await makeHooks({
+			configJson: '{"default":["prov/m1"],"taskGuard":{"enabled":false}}'
+		})
+		expect(hooks['experimental.chat.messages.transform']).toBeUndefined()
+	})
+
+	test('leaves the guard out when the plugin itself is disabled', async () => {
+		const { hooks } = await makeHooks({ configJson: '{"enabled":false,"default":["prov/m1"]}' })
+		expect(hooks['experimental.chat.messages.transform']).toBeUndefined()
+	})
+
+	test('recovers a phantom task part through the wired hook', async () => {
+		const { hooks } = await makeHooks({
+			configJson: '{"default":["prov/m1"],"taskGuard":{"timeoutSeconds":1}}',
+			sessionStatusData: { ses_child: { type: 'idle' } },
+			sessionMessagesData: [
+				{
+					info: { id: 'msg_c1', role: 'assistant', sessionID: 'ses_child', time: { created: 1 }, finish: 'stop' },
+					parts: [{ type: 'text', text: 'CHILD-OK' }]
+				}
+			]
+		})
+		const part = phantomPart()
+
+		await hooks['experimental.chat.messages.transform']!({}, phantomOutput(part))
+
+		const state = part.state as unknown as Record<string, unknown>
+		expect(state.status).toBe('completed')
+		expect(state.output).toBe('CHILD-OK')
+		expect(state.title).toBe('ping')
+	})
+})

@@ -28,6 +28,7 @@ import { selectNextEntry, type FailingIdentity } from '../domain/selection'
 import { fetchKnownAgents, knownAgentsFromConfig, unknownAgentNames } from './agents'
 import { defaultConfigLoaderDeps, loadConfig, type ConfigLoaderDeps } from './config-loader'
 import { createLogger, type Logger } from './log'
+import { createTaskGuard } from './task-guard'
 
 type Client = Parameters<Plugin>[0]['client']
 type ChatMessageOutput = Parameters<NonNullable<Hooks['chat.message']>>[1]
@@ -404,6 +405,22 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 		await resendNext(sessionID, state, agent, next)
 	}
 
+	/**
+	 * The phantom `Task cancelled` guard. It is the only channel that can still
+	 * show the model the orphaned child's answer, so it is wired exactly when both
+	 * the plugin and the task guard are enabled; otherwise the transform hook is
+	 * not registered at all and costs nothing per LLM call.
+	 */
+	const taskGuard =
+		config.enabled && config.taskGuard.enabled
+			? createTaskGuard({
+					client,
+					logger,
+					timeoutMs: config.taskGuard.timeoutSeconds * 1000,
+					resendInterruptedChild: config.taskGuard.resendInterruptedChild
+				})
+			: undefined
+
 	const hooks: Hooks = {
 		dispose: async () => {
 			try {
@@ -656,6 +673,8 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 			}
 		}
 	}
+
+	if (taskGuard !== undefined) hooks['experimental.chat.messages.transform'] = taskGuard
 
 	return hooks
 }

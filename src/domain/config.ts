@@ -17,6 +17,16 @@ export type CooldownSeconds = {
 	poolUnavailable: number
 }
 
+/** Phantom `Task cancelled` guard (opencode #45556). */
+export type TaskGuardConfig = {
+	/** Whether `experimental.chat.messages.transform` is wired at all. */
+	enabled: boolean
+	/** Hard budget for waiting on one orphaned subagent session. */
+	timeoutSeconds: number
+	/** Prompt an idle child that never produced a final answer, exactly once. */
+	resendInterruptedChild: boolean
+}
+
 export type PluginConfig = {
 	enabled: boolean
 	agents: Record<string, ChainEntry[]>
@@ -24,6 +34,7 @@ export type PluginConfig = {
 	/** Optional map grouping providerIDs under one pool name. */
 	pools: Record<string, string>
 	cooldownSeconds: CooldownSeconds
+	taskGuard: TaskGuardConfig
 }
 
 export type ConfigIssue = {
@@ -45,7 +56,13 @@ export const DEFAULT_COOLDOWNS: CooldownSeconds = {
 	poolUnavailable: 21600
 }
 
-const KNOWN_KEYS = new Set(['enabled', 'agents', 'default', 'pools', 'cooldownSeconds'])
+export const DEFAULT_TASK_GUARD: TaskGuardConfig = {
+	enabled: true,
+	timeoutSeconds: 600,
+	resendInterruptedChild: true
+}
+
+const KNOWN_KEYS = new Set(['enabled', 'agents', 'default', 'pools', 'cooldownSeconds', 'taskGuard'])
 const COOLDOWN_KEYS = ['rateLimit', 'quota', 'transient', 'poolUnavailable'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -129,6 +146,41 @@ function applyCooldowns(raw: unknown, target: CooldownSeconds, issues: ConfigIss
 	}
 }
 
+/**
+ * Task-guard overrides. Unknown keys inside `taskGuard` are ignored, matching
+ * how `cooldownSeconds` treats its own unknown keys.
+ */
+function applyTaskGuard(raw: unknown, target: TaskGuardConfig, issues: ConfigIssue[]): void {
+	if (raw === undefined) return
+	if (!isRecord(raw)) {
+		issues.push({ severity: 'warning', path: 'taskGuard', message: 'must be an object' })
+		return
+	}
+	if ('enabled' in raw) {
+		if (typeof raw.enabled === 'boolean') target.enabled = raw.enabled
+		else issues.push({ severity: 'warning', path: 'taskGuard.enabled', message: 'must be a boolean' })
+	}
+	if ('timeoutSeconds' in raw) {
+		const value = raw.timeoutSeconds
+		if (typeof value === 'number' && Number.isFinite(value) && value > 0) target.timeoutSeconds = value
+		else
+			issues.push({
+				severity: 'warning',
+				path: 'taskGuard.timeoutSeconds',
+				message: 'must be a positive number of seconds'
+			})
+	}
+	if ('resendInterruptedChild' in raw) {
+		if (typeof raw.resendInterruptedChild === 'boolean') target.resendInterruptedChild = raw.resendInterruptedChild
+		else
+			issues.push({
+				severity: 'warning',
+				path: 'taskGuard.resendInterruptedChild',
+				message: 'must be a boolean'
+			})
+	}
+}
+
 export function parseConfig(raw: unknown): ParseConfigResult {
 	const issues: ConfigIssue[] = []
 	const config: PluginConfig = {
@@ -136,7 +188,8 @@ export function parseConfig(raw: unknown): ParseConfigResult {
 		agents: dict<ChainEntry[]>(),
 		default: [],
 		pools: dict<string>(),
-		cooldownSeconds: { ...DEFAULT_COOLDOWNS }
+		cooldownSeconds: { ...DEFAULT_COOLDOWNS },
+		taskGuard: { ...DEFAULT_TASK_GUARD }
 	}
 	if (raw === undefined || raw === null) return { config, issues }
 	if (!isRecord(raw)) {
@@ -183,6 +236,8 @@ export function parseConfig(raw: unknown): ParseConfigResult {
 	}
 
 	if ('cooldownSeconds' in raw) applyCooldowns(raw.cooldownSeconds, config.cooldownSeconds, issues)
+
+	if ('taskGuard' in raw) applyTaskGuard(raw.taskGuard, config.taskGuard, issues)
 
 	return { config, issues }
 }

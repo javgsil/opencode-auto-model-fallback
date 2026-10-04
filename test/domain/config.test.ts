@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { chainFor, parseConfig, parseModelRef, resolvePool } from '../../src/domain/config'
 
 const DEFAULT_COOLDOWNS = { rateLimit: 60, quota: 1800, transient: 30, poolUnavailable: 21600 }
+const DEFAULT_TASK_GUARD = { enabled: true, timeoutSeconds: 600, resendInterruptedChild: true }
 
 describe('parseConfig', () => {
 	test('applies defaults for missing and nullish config', () => {
@@ -12,7 +13,8 @@ describe('parseConfig', () => {
 				agents: {},
 				default: [],
 				pools: {},
-				cooldownSeconds: DEFAULT_COOLDOWNS
+				cooldownSeconds: DEFAULT_COOLDOWNS,
+				taskGuard: DEFAULT_TASK_GUARD
 			})
 			expect(issues).toEqual([])
 		}
@@ -89,6 +91,39 @@ describe('parseConfig', () => {
 		expect(parseConfig('nope').issues).toHaveLength(1)
 		expect(parseConfig(42).config.enabled).toBe(true)
 		expect(parseConfig(42).issues[0]?.path).toBe('config')
+	})
+
+	test('parses task guard overrides', () => {
+		const { config, issues } = parseConfig({
+			taskGuard: { enabled: false, timeoutSeconds: 30, resendInterruptedChild: false }
+		})
+		expect(issues).toEqual([])
+		expect(config.taskGuard).toEqual({ enabled: false, timeoutSeconds: 30, resendInterruptedChild: false })
+	})
+
+	test('warns on wrong-typed task guard fields and keeps their defaults', () => {
+		const { config, issues } = parseConfig({
+			taskGuard: { enabled: 'yes', timeoutSeconds: -5, resendInterruptedChild: 1 }
+		})
+		expect(config.taskGuard).toEqual(DEFAULT_TASK_GUARD)
+		expect(issues.map((issue) => issue.path)).toEqual([
+			'taskGuard.enabled',
+			'taskGuard.timeoutSeconds',
+			'taskGuard.resendInterruptedChild'
+		])
+		expect(issues.every((issue) => issue.severity === 'warning')).toBe(true)
+	})
+
+	test('warns when task guard is not an object and keeps the defaults', () => {
+		const { config, issues } = parseConfig({ taskGuard: 'on' })
+		expect(config.taskGuard).toEqual(DEFAULT_TASK_GUARD)
+		expect(issues).toHaveLength(1)
+		expect(issues[0]?.path).toBe('taskGuard')
+	})
+
+	test('treats taskGuard as a known key', () => {
+		const { issues } = parseConfig({ taskGuard: {} })
+		expect(issues).toEqual([])
 	})
 })
 
