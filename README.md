@@ -1,4 +1,4 @@
-# opencode-agent-fallback
+# opencode-auto-model-fallback
 
 An [opencode](https://opencode.ai) plugin that gives each agent its own ordered model fallback chain. When a model fails
 with a fallback-eligible error, the plugin resends your original message to the next model in that agent's chain,
@@ -9,7 +9,7 @@ keeping the same agent, and cools down the failing pool or model so later reques
 1. Add the plugin to your opencode config (`~/.config/opencode/opencode.json`):
 
    ```json
-   { "plugin": ["opencode-agent-fallback@0.2.0"] }
+   { "plugin": ["opencode-auto-model-fallback@0.2.0"] }
    ```
 
 2. Create `~/.config/opencode/agent-fallback.json`:

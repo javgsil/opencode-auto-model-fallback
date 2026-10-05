@@ -317,7 +317,7 @@ describe('fallback resend', () => {
 		expect(call.body?.model).toEqual({ providerID: 'prov', modelID: 'c2' })
 		expect(call.body?.variant).toBeUndefined()
 		expect(call.body?.parts).toEqual([{ type: 'text', text: 'hello' }])
-		expect(logCalls.every((body) => body.service === 'opencode-agent-fallback')).toBe(true)
+		expect(logCalls.every((body) => body.service === 'opencode-auto-model-fallback')).toBe(true)
 	})
 
 	test('sends the chain entry variant when one is defined and omits it otherwise', async () => {
@@ -1070,7 +1070,7 @@ describe('init validation and config reporting', () => {
 		const { logCalls } = await makeHooks({ configJson: '{broken json' })
 		const errors = logCalls.filter((body) => body.level === 'error' && String(body.message).includes('invalid JSON'))
 		expect(errors).toHaveLength(1)
-		expect(errors[0]?.service).toBe('opencode-agent-fallback')
+		expect(errors[0]?.service).toBe('opencode-auto-model-fallback')
 		expect(String(errors[0]?.message)).toContain(FAKE_CONFIG_PATH)
 	})
 })

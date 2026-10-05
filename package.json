@@ -1,5 +1,5 @@
 {
-	"name": "opencode-agent-fallback",
+	"name": "opencode-auto-model-fallback",
 	"version": "0.2.0",
 	"description": "opencode plugin giving each agent an ordered model fallback chain with pool-aware cooldowns",
 	"type": "module",
@@ -7,11 +7,11 @@
 	"author": "Francisco Gonzalez <javiergonzalezsilva@gmail.com>",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/javgsil/opencode-agent-fallback.git"
+		"url": "git+https://github.com/javgsil/opencode-auto-model-fallback.git"
 	},
-	"homepage": "https://github.com/javgsil/opencode-agent-fallback#readme",
+	"homepage": "https://github.com/javgsil/opencode-auto-model-fallback#readme",
 	"bugs": {
-		"url": "https://github.com/javgsil/opencode-agent-fallback/issues"
+		"url": "https://github.com/javgsil/opencode-auto-model-fallback/issues"
 	},
 	"keywords": [
 		"opencode",
