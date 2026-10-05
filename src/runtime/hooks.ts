@@ -1,6 +1,13 @@
 /**
- * Runtime wiring: config loading, init-time agent validation, and the opencode
+ * Runtime wiring: config loading, best-effort agent validation, and the opencode
  * hooks that drive the fallback chain.
+ *
+ * Startup contract: `createHooks` and the `config` hook NEVER await a client
+ * call. The opencode server does not answer HTTP until plugin initialization
+ * finishes, so any awaited client call during init deadlocks boot. Agent-name
+ * validation therefore runs detached: synchronously from the config-hook agent
+ * map when that map is available, and otherwise as a deferred, bounded,
+ * fire-and-forget server fetch that swallows every failure at debug level.
  *
  * State machine per session (one user request at a time):
  * - `chat.message` (genuine) starts a request: captures the resendable user
@@ -46,6 +53,13 @@ type TimerHandle = ReturnType<typeof setTimeout>
  * double-sending.
  */
 const DEFAULT_SESSION_ERROR_GRACE_MS = 250
+
+/**
+ * Bound on the detached server-side agent-validation fetch. The call is never
+ * awaited, so this only keeps a hung transport from leaving the once-only
+ * background attempt unresolved forever.
+ */
+const AGENT_VALIDATION_TIMEOUT_MS = 2000
 
 /**
  * A `session.error` arriving within this window of an already-observed failure is the
@@ -131,6 +145,27 @@ function errorDetails(error: unknown): { name?: string; message?: string; status
 
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Bound a promise by a timeout: on expiry the returned promise rejects while
+ * the input promise is abandoned in place — its handlers stay attached, so a
+ * late settlement can neither reject unhandled nor change the outcome.
+ */
+function withTimeout<T>(promise: PromiseLike<T>, ms: number): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
+		void promise.then(
+			(value) => {
+				clearTimeout(timer)
+				resolve(value)
+			},
+			(error: unknown) => {
+				clearTimeout(timer)
+				reject(error)
+			}
+		)
+	})
 }
 
 /** Chat params `model.id` may be a bare modelID or `provider/modelID`. */
@@ -232,8 +267,35 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 			logger.warn(`unknown agent "${name}" in the agent-fallback configuration`)
 		}
 	}
-	const serverAgents = await fetchKnownAgents(client)
-	if (serverAgents !== null) validateAgents(serverAgents)
+
+	/**
+	 * Server-side validation, detached so plugin initialization can never wait
+	 * on the HTTP client: the opencode server does not answer requests until
+	 * init finishes, so awaiting `client.app.agents()` here deadlocks boot. The
+	 * attempt runs at most once, starts on the next loop turn (after
+	 * initialization), is bounded by `AGENT_VALIDATION_TIMEOUT_MS`, never
+	 * throws — every failure is logged at debug level — and stands down when a
+	 * config-hook validation already ran, before or during the fetch.
+	 */
+	let serverValidationStarted = false
+	const scheduleServerValidation = (): void => {
+		if (serverValidationStarted) return
+		serverValidationStarted = true
+		setTimeout(() => {
+			if (agentsValidated) return
+			void (async () => {
+				try {
+					const known = await withTimeout(fetchKnownAgents(client), AGENT_VALIDATION_TIMEOUT_MS)
+					if (agentsValidated) return
+					if (known !== null) validateAgents(known)
+					else logger.debug('agent validation skipped: no known-agent source available')
+				} catch (error) {
+					logger.debug(`background agent validation failed: ${describeError(error)}`)
+				}
+			})()
+		}, 0)
+	}
+	scheduleServerValidation()
 
 	const sessions = new Map<string, SessionState>()
 	let disposed = false
@@ -666,7 +728,11 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 		config: async (input: ConfigHookInput) => {
 			try {
 				if (agentsValidated) return
-				const known = (await fetchKnownAgents(client)) ?? knownAgentsFromConfig(input)
+				// Synchronous and client-free: this hook can run during initialization, so an
+				// awaited client call here would deadlock boot exactly like `createHooks` did.
+				// The config-hook agent map is the known-agent source; the deferred server
+				// fetch stands down once this validation ran.
+				const known = knownAgentsFromConfig(input)
 				if (known !== null) validateAgents(known)
 			} catch (error) {
 				logger.error(`config hook failed: ${describeError(error)}`)

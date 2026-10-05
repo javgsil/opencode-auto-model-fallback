@@ -87,6 +87,8 @@ async function makeHooks(
 		configJson?: string | null
 		agentsData?: unknown
 		hasAgentsApi?: boolean
+		/** Make `client.app.agents()` return a promise that never settles (startup-deadlock regression tests). */
+		neverSettleAgents?: boolean
 		sessionErrorGraceMs?: number
 		rejectPrompt?: boolean
 		rejectLog?: boolean
@@ -118,7 +120,12 @@ async function makeHooks(
 	if (options.rejectAbort === true) abortsToReject = Number.POSITIVE_INFINITY
 	let abortsToDefer = options.deferAbortTimes ?? 0
 	const app: Record<string, unknown> = {}
-	if (options.hasAgentsApi !== false) app.agents = async () => ({ data: options.agentsData ?? [{ name: 'coder' }] })
+	if (options.hasAgentsApi !== false) {
+		app.agents =
+			options.neverSettleAgents === true
+				? () => new Promise<never>(() => {})
+				: async () => ({ data: options.agentsData ?? [{ name: 'coder' }] })
+	}
 	app.log = async (call: { body?: LogBody }) => {
 		if (options.rejectLog) throw new Error('log transport down')
 		if (call.body) logCalls.push(call.body)
@@ -842,11 +849,38 @@ describe('robustness', () => {
 })
 
 describe('init validation and config reporting', () => {
+	test('createHooks resolves even when client.app.agents() never settles', async () => {
+		const build = makeHooks({ neverSettleAgents: true })
+		const winner = await Promise.race([build.then(() => 'resolved' as const), sleep(200).then(() => 'hung' as const)])
+		expect(winner).toBe('resolved')
+		await build
+	})
+
+	test('config hook resolves promptly with a never-settling app.agents() and warns from the config map', async () => {
+		const build = makeHooks({
+			neverSettleAgents: true,
+			configJson: '{"agents":{"coder":[],"typo-agent":[]}}'
+		})
+		const fixture = await Promise.race([build, sleep(200).then(() => null)])
+		expect(fixture).not.toBeNull()
+		if (fixture === null) return
+		const call = fixture.hooks.config!({ agent: { coder: {} } })
+		const settled = await Promise.race([call.then(() => 'resolved' as const), sleep(200).then(() => 'hung' as const)])
+		expect(settled).toBe('resolved')
+		await call
+		const unknown = fixture.logCalls.filter((body) => String(body.message).includes('unknown agent'))
+		expect(unknown).toHaveLength(1)
+		expect(String(unknown[0]?.message)).toContain('typo-agent')
+		expect(unknown[0]?.level).toBe('warn')
+	})
+
 	test('warns for configured agents missing from client.app.agents()', async () => {
 		const { logCalls } = await makeHooks({
 			agentsData: [{ name: 'coder' }],
 			configJson: '{"agents":{"coder":[],"typo-agent":[]}}'
 		})
+		// The server-side validation is background work now: give the detached fetch a tick to land.
+		await sleep(10)
 		const unknown = logCalls.filter((body) => String(body.message).includes('unknown agent'))
 		expect(unknown).toHaveLength(1)
 		expect(String(unknown[0]?.message)).toContain('typo-agent')
