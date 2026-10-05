@@ -49,6 +49,15 @@ fallback answer had not been observed live.
       Task-cancel recovery was not exercised. Note: this machine has no `opencode-go` region error to reproduce, so the
       real opencode-go path is still unobserved here.
 - [x] T7 README with install and config docs (inline). Commit `09909e7`.
+- [x] T8 Fix F1 (user-authorized, delegated writer, test-first). Commit `959940c`. A genuine `chat.message` seeds the
+      identity from the resolved model; the pending resend's echo seeds the resend target; a `session.error` reading
+      `Model not found: <provider>/<model>.` for the live model bypasses the pending-resend guard and twin suppression.
+      RED 3 failing tests, GREEN 170/170. Live (`opencode serve`): an unknown `opencode-go` model fell back to
+      `opencode/mimo-v2.6-flash-free` (answer `PONG`, agent `build`); a double rejection (`opencode-go/nope-1`,
+      `anthropic/nope-2`) advanced twice to the same answer. Residual: after exhausting the chain by rejections,
+      `pendingResend` stays set until the next user message.
+- [ ] T9 Package name: unscoped `opencode-model-fallback` is taken on npm (likas21, v1.0.6, no repository). Scoped
+      `@javgsil/opencode-model-fallback` and GitHub `javgsil/opencode-model-fallback` are free. Pending user choice.
 
 ## Findings for the user
 
@@ -69,6 +78,7 @@ fallback answer had not been observed live.
 ## Progress / evidence
 
 - Checks: `bun run check` exit 0 (165 tests, tsc, prettier, eslint) after T3 and T7.
-- RDD: assess over `922a129..21000e5` = medium, `review_due: false` (`under_budget`).
+- RDD: assess over `922a129..21000e5` = medium, `review_due: false` (`under_budget`). After `959940c`: medium, 488
+  lines, `review_due: true` (`slice_budget_reached`); consent pending (lineage `review-091ec510165b2d21`).
 
 - T1: `git log --all --format='%ae%n%ce' | sort | uniq -c` -> `16 javiergonzalezsilva@gmail.com`.
