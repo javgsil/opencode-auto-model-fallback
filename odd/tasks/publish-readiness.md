@@ -66,6 +66,9 @@ fallback answer had not been observed live.
 - [x] T11 Publishing hardening (delegated writer): CI workflow, release workflow using npm trusted publishing (OIDC,
       `npm stage publish`, SHA-pinned actions, minimal permissions), Dependabot for actions and bun, `SECURITY.md`, `publishConfig.access`. Action SHAs verified
       via the GitHub API; workflows parse but have not run yet.
+- [x] T11b Review `review-59efec0560fa063a` (4 lenses) approved and acknowledged. Advisories applied: checks run in a
+      job without OIDC permission (R1), per-tag release concurrency so a pending tag is never evicted (R3/R4). R2 README
+      duplication left as is.
 - [x] T12 Professional README (delegated writer), claims checked against `src/`.
 - [ ] T13 User-side steps (cannot be automated): npm account with security-key 2FA, first manual publish, trusted
       publisher, "Require 2FA and disallow tokens", GitHub tag ruleset, decide repo visibility (public enables provenance
