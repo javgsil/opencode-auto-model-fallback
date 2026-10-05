@@ -32,8 +32,7 @@ fallback answer had not been observed live.
       `a3851b7`.
 - [x] T3 T4-F4: test the production `defaultSleep` directly (inline, test-first). `defaultSleep` is now exported; four
       direct tests (plain delay, pre-aborted signal arms no timer, abort clears the pending timer, listener detached after
-      firing); the deadline-release test uses the production function instead of a copy. RED: `Export named
-    'defaultSleep' not found`; GREEN: 26/26; mutation (drop `clearTimeout`) fails the clear test. Commit `21000e5`.
+      firing); the deadline-release test uses the production function instead of a copy. RED: the missing export failed the suite; GREEN: 26/26; mutation (drop `clearTimeout`) fails the clear test. Commit `21000e5`.
 - [x] T4 Packaging (delegated, isolated). `npm pack --dry-run`: 12 files, 25.0 kB, no warnings (13 files / 26.6 kB
       with README). Published only to a localhost verdaccio with temp XDG dirs; opencode 1.18.34 installed it with npm
       into `$XDG_CACHE_HOME/opencode/packages/opencode-agent-fallback@0.2.0/` and loaded the TS source (the plugin's
@@ -49,7 +48,7 @@ fallback answer had not been observed live.
       agent stayed `build`. A second session skipped the cooling pool and went straight to the fallback. Phantom
       Task-cancel recovery was not exercised. Note: this machine has no `opencode-go` region error to reproduce, so the
       real opencode-go path is still unobserved here.
-- [x] T7 README with install and config docs (inline).
+- [x] T7 README with install and config docs (inline). Commit `09909e7`.
 
 ## Findings for the user
 
