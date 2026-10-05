@@ -27,6 +27,9 @@
 		"src",
 		"LICENSE"
 	],
+	"publishConfig": {
+		"access": "public"
+	},
 	"engines": {
 		"bun": ">=1.2"
 	},
