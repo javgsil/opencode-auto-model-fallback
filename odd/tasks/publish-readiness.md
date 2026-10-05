@@ -61,10 +61,9 @@ fallback answer had not been observed live.
 
 ## Findings for the user
 
-- F1 (gap, not fixed): when opencode itself rejects the model (`ProviderModelNotFoundError`, e.g. a model id missing
+- F1 (gap, fixed in T8): when opencode itself rejects the model (`ProviderModelNotFoundError`, e.g. a model id missing
   from its registry), only `session.error` fires, before `chat.params`, so the plugin has no identity and silently
   skips fallback (`src/runtime/hooks.ts` identity guard). Provider-returned "model not found" errors do fall back.
-  Fixing it means deriving identity from the user message; a product decision, left for the user.
 - F2 (false alarm): opencode calls every exported function of a plugin module, but 1.18.34 dedupes identical function
   references (`packages/opencode/src/plugin/index.ts`, `seen` set), and `src/index.ts` exports the same reference as
   named and default, so it registers once. Only a wrapper exporting two distinct functions would double-register.
@@ -79,6 +78,8 @@ fallback answer had not been observed live.
 
 - Checks: `bun run check` exit 0 (165 tests, tsc, prettier, eslint) after T3 and T7.
 - RDD: assess over `922a129..21000e5` = medium, `review_due: false` (`under_budget`). After `959940c`: medium, 488
-  lines, `review_due: true` (`slice_budget_reached`); consent pending (lineage `review-091ec510165b2d21`).
+  lines, `review_due: true` (`slice_budget_reached`); consent granted, lineage `review-a1d92eca4fe75655` approved and acknowledged (authority burned). Advisory
+  R3-model-rejection-prefix (`c2` matched a rejection of `c2.x`) fixed test-first afterwards: RED 1 failing test,
+  GREEN 172/172.
 
 - T1: `git log --all --format='%ae%n%ce' | sort | uniq -c` -> `16 javiergonzalezsilva@gmail.com`.
