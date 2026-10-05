@@ -470,6 +470,104 @@ describe('task guard: failure paths', () => {
 	})
 })
 
+describe('task guard: deadline timer release', () => {
+	/** A real, abortable sleep mirroring the default implementation. */
+	function realSleep(ms: number, signal?: AbortSignal): Promise<void> {
+		return new Promise((resolve) => {
+			if (signal?.aborted) {
+				resolve()
+				return
+			}
+			const timer = setTimeout(() => {
+				signal?.removeEventListener('abort', release)
+				resolve()
+			}, ms)
+			function release(): void {
+				clearTimeout(timer)
+				resolve()
+			}
+			signal?.addEventListener('abort', release, { once: true })
+		})
+	}
+
+	const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+	test('releases the losing deadline timer of an asynchronously winning call', async () => {
+		const timerSignals: AbortSignal[] = []
+		const requestSignals: AbortSignal[] = []
+		const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+			if (signal !== undefined) timerSignals.push(signal)
+			return realSleep(ms, signal)
+		}
+		// Real timers on both sides: every client call settles only after a 5ms
+		// `setTimeout`, well past the SETTLE_YIELD microtask turns, so `withDeadline`
+		// arms its deadline timer for each of them against a 600s budget.
+		const client = {
+			session: {
+				status: async (call: { signal?: AbortSignal }): Promise<unknown> => {
+					if (call.signal !== undefined) requestSignals.push(call.signal)
+					await delay(5)
+					return { data: idle(CHILD) }
+				},
+				messages: async (call: { signal?: AbortSignal }): Promise<unknown> => {
+					if (call.signal !== undefined) requestSignals.push(call.signal)
+					await delay(5)
+					return { data: childTurn('CHILD-OK', { finish: 'stop' }) }
+				},
+				promptAsync: async (): Promise<unknown> => ({})
+			}
+		} as unknown as Client
+		const { guard } = setup({}, { client, timeoutMs: 600000, now: Date.now, sleep })
+		const part = taskPart()
+
+		await guard({}, transformOutput([part]))
+
+		expect(stateOf(part).status).toBe('completed')
+		expect(stateOf(part).output).toBe('CHILD-OK')
+		// Every armed deadline timer carries a scope signal, and every one of them was
+		// released once its call won, so no losing sleep outlives its own call.
+		expect(timerSignals.length).toBeGreaterThan(0)
+		expect(timerSignals.every((signal) => signal.aborted)).toBe(true)
+		// A winning call's request controller is never aborted by the deadline callback.
+		expect(requestSignals.length).toBeGreaterThan(0)
+		expect(requestSignals.every((signal) => !signal.aborted)).toBe(true)
+	}, 2000)
+
+	test('still aborts a genuinely stalled call through the default real sleep', async () => {
+		const requestSignals: AbortSignal[] = []
+		const client = {
+			session: {
+				status: (call: { signal?: AbortSignal }): Promise<unknown> => {
+					if (call.signal !== undefined) requestSignals.push(call.signal)
+					return new Promise(() => {})
+				},
+				messages: async (): Promise<unknown> => ({ data: [] }),
+				promptAsync: async (): Promise<unknown> => ({})
+			}
+		} as unknown as Client
+		const { logger } = makeLogger()
+		// No injected `sleep` and a real clock: the default timer must fire on its own, abort the
+		// stalled call through the request controller and settle as a blown deadline.
+		const guard = createTaskGuard({
+			client,
+			logger,
+			timeoutMs: 500,
+			resendInterruptedChild: false,
+			now: Date.now
+		})
+		const part = taskPart()
+
+		await guard({}, transformOutput([part]))
+
+		expect(requestSignals.length).toBeGreaterThan(0)
+		expect(requestSignals[0]?.aborted).toBe(true)
+		const state = stateOf(part)
+		expect(state.status).toBe('error')
+		expect(String(state.error)).toContain(CHILD)
+		expect(String(state.error)).toMatch(/timeout/i)
+	}, 2000)
+})
+
 describe('task guard: stalled client calls', () => {
 	const stalled: Record<string, { behaviour: Behaviour; timeoutMs: number; promptCalls: number }> = {
 		'session.status': { behaviour: { status: () => new Promise(() => {}) }, timeoutMs: 3000, promptCalls: 0 },

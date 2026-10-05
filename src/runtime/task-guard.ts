@@ -82,7 +82,12 @@ export type TaskGuardOptions = {
 	resendInterruptedChild: boolean
 	/** Injectable clock and sleep so tests are deterministic and instant. */
 	now?: () => number
-	sleep?: (ms: number) => Promise<void>
+	/**
+	 * `sleep` receives the optional scope signal of the deadline timer that armed it and must
+	 * settle as soon as that signal aborts, so a losing timer can be released instead of
+	 * outliving the call it raced (the default implementation clears its `setTimeout`).
+	 */
+	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 function readString(value: unknown, key: string): string | undefined {
@@ -231,6 +236,29 @@ function explainError(outcome: Extract<TaskGuardOutcome, { kind: 'explained' }>)
 }
 
 /**
+ * Default timer behind the injectable `sleep`: a real `setTimeout` that is cleared as soon as
+ * its scope signal aborts, so a deadline timer that lost its race leaves no pending timer
+ * behind (review R3-losing-deadline-timers).
+ */
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) {
+			resolve()
+			return
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener('abort', release)
+			resolve()
+		}, ms)
+		function release(): void {
+			clearTimeout(timer)
+			resolve()
+		}
+		signal?.addEventListener('abort', release, { once: true })
+	})
+}
+
+/**
  * Transform guard for one plugin instance. Outcomes are cached per owning part
  * identity so a later transform reuses them instantly, and concurrent transforms
  * for the same part share the single in-flight wait.
@@ -238,14 +266,15 @@ function explainError(outcome: Extract<TaskGuardOutcome, { kind: 'explained' }>)
 export function createTaskGuard(options: TaskGuardOptions): TransformHandler {
 	const { client, logger, timeoutMs, resendInterruptedChild } = options
 	const now = options.now ?? Date.now
-	const sleep = options.sleep ?? ((ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)))
+	const sleep = options.sleep ?? defaultSleep
 	const outcomes = new Map<string, Promise<TaskGuardOutcome>>()
 
 	/**
 	 * Bounds an already-started client call by the absolute `deadline`, racing it against a timer
 	 * built on the injected `sleep`. On timeout `controller` aborts the call's `AbortSignal` (the SDK
 	 * request options inherit `signal` from `RequestInit`), so the fetch is cancelled rather than
-	 * abandoned; the losing promise always carries a no-op catch so it cannot reject unhandled.
+	 * abandoned; the losing promise always carries a no-op catch so it cannot reject unhandled, and
+	 * the losing timer is released through its scope signal as soon as the race settles.
 	 */
 	const withDeadline = async <T>(pending: Promise<T>, controller: AbortController, deadline: number): Promise<T> => {
 		let done = false
@@ -257,12 +286,24 @@ export function createTaskGuard(options: TaskGuardOptions): TransformHandler {
 		for (let turn = 0; turn < SETTLE_YIELD && !done; turn += 1) await Promise.resolve()
 		if (done) return await tracked
 		const remainingMs = Math.max(0, deadline - now())
-		const timer = sleep(remainingMs).then(() => {
-			controller.abort()
-			throw new DeadlineExceededError(remainingMs)
-		})
-		timer.catch(() => {})
-		return await Promise.race([tracked, timer])
+		// Timer scope: aborted in the `finally` below the moment the race settles, so the losing
+		// sleep is released immediately instead of keeping its timer (and its controller) alive for
+		// the whole remaining budget, which would otherwise accumulate across polls.
+		const timerScope = new AbortController()
+		try {
+			const timer = sleep(remainingMs, timerScope.signal).then(() => {
+				// The scope is only aborted once the race has settled, so this callback is reachable
+				// only while its timer still holds the race: the request controller of an already
+				// winning call is never aborted here. The throw below is always swallowed by the
+				// catch attached next, because a released timer settles after the race decided.
+				if (!timerScope.signal.aborted) controller.abort()
+				throw new DeadlineExceededError(remainingMs)
+			})
+			timer.catch(() => {})
+			return await Promise.race([tracked, timer])
+		} finally {
+			timerScope.abort()
+		}
 	}
 
 	const childStatus = async (childID: string, deadline: number): Promise<ChildStatus> => {
