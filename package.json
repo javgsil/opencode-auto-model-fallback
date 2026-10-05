@@ -4,6 +4,15 @@
 	"description": "opencode plugin giving each agent an ordered model fallback chain with pool-aware cooldowns",
 	"type": "module",
 	"license": "MIT",
+	"author": "Francisco Gonzalez <javiergonzalezsilva@gmail.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/javgsil/opencode-agent-fallback.git"
+	},
+	"homepage": "https://github.com/javgsil/opencode-agent-fallback#readme",
+	"bugs": {
+		"url": "https://github.com/javgsil/opencode-agent-fallback/issues"
+	},
 	"keywords": [
 		"opencode",
 		"opencode-plugin",
