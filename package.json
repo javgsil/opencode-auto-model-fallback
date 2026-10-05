@@ -1,26 +1,45 @@
 {
 	"name": "opencode-agent-fallback",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "opencode plugin giving each agent an ordered model fallback chain with pool-aware cooldowns",
 	"type": "module",
-	"private": true,
 	"license": "MIT",
+	"keywords": [
+		"opencode",
+		"opencode-plugin",
+		"fallback",
+		"rate-limit"
+	],
 	"main": "src/index.ts",
 	"exports": {
 		".": "./src/index.ts"
+	},
+	"files": [
+		"src",
+		"LICENSE"
+	],
+	"engines": {
+		"bun": ">=1.2"
 	},
 	"scripts": {
 		"test": "bun test",
 		"typecheck": "tsc --noEmit",
 		"lint": "eslint .",
 		"format:check": "prettier --check .",
-		"format": "prettier --write ."
+		"format": "prettier --write .",
+		"check": "bun test && tsc --noEmit && prettier --check . && eslint ."
 	},
-	"dependencies": {
-		"@opencode-ai/plugin": "1.18.34"
+	"peerDependencies": {
+		"@opencode-ai/plugin": ">=1.18.34"
+	},
+	"peerDependenciesMeta": {
+		"@opencode-ai/plugin": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.5",
+		"@opencode-ai/plugin": "1.18.34",
 		"@types/bun": "^1.4.2",
 		"eslint": "^9.39.5",
 		"prettier": "^3.9.9",
