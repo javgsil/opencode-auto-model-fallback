@@ -880,6 +880,34 @@ describe('opencode-side model rejection', () => {
 		expect(prompts[1]?.body?.model).toEqual({ providerID: 'third', modelID: 'c3' })
 	})
 
+	test('ignores a pending-resend rejection of a model whose id only extends the live one', async () => {
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"agents":{"coder":["prov/c1","other/c2","third/c3"]}}',
+			sessionErrorGraceMs: 5
+		})
+		await emitRejectedRequest(hooks, 's1', 'c1')
+		await emitResendEcho(hooks, 's1', prompts, 0)
+		await hooks.event!({
+			event: { type: 'session.error', properties: { sessionID: 's1', error: modelNotFound('other', 'c2.x') } }
+		})
+		await sleep(25)
+		expect(prompts).toHaveLength(1)
+	})
+
+	test('still matches a rejection that carries opencode suggestions', async () => {
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"agents":{"coder":["prov/c1","other/c2","third/c3"]}}',
+			sessionErrorGraceMs: 5
+		})
+		await emitRejectedRequest(hooks, 's1', 'c1')
+		await emitResendEcho(hooks, 's1', prompts, 0)
+		const error = { name: 'UnknownError' as const, data: { message: 'Model not found: other/c2. Did you mean: c2.x?' } }
+		await hooks.event!({ event: { type: 'session.error', properties: { sessionID: 's1', error } } })
+		await sleep(25)
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'third', modelID: 'c3' })
+	})
+
 	test('logs exhaustion once when opencode rejects the last chain entry', async () => {
 		const { hooks, prompts, logCalls } = await makeHooks({
 			configJson: '{"agents":{"coder":["prov/c1","other/c2"]}}',

@@ -206,11 +206,13 @@ function identityFromChatMessage(input: ChatMessageInput, output: ChatMessageOut
  * Whether a `session.error` message is opencode's own registry rejection of exactly the
  * model the session is running: its run loop publishes `Model not found: <provider>/<model>.`
  * (plus an optional suggestion) after `chat.message` and before `chat.params`, so the
- * embedded ids are the only signal tying the failure to that model. The whole pair is one
- * prefix, which keeps model ids containing dots exact.
+ * embedded ids are the only signal tying the failure to that model. The closing dot must end
+ * the message or precede the suggestion's space, so `c2` never matches a rejection of `c2.x`.
  */
 function rejectsLiveModel(message: string | undefined, providerID: string, modelID: string): boolean {
-	return message !== undefined && message.startsWith(`Model not found: ${providerID}/${modelID}.`)
+	const prefix = `Model not found: ${providerID}/${modelID}.`
+	if (message === undefined || !message.startsWith(prefix)) return false
+	return message.length === prefix.length || message[prefix.length] === ' '
 }
 
 function identityEntry(identity: { providerID: string; modelID: string; variant?: string }): ChainEntry {
