@@ -56,8 +56,10 @@ fallback answer had not been observed live.
       `opencode/mimo-v2.6-flash-free` (answer `PONG`, agent `build`); a double rejection (`opencode-go/nope-1`,
       `anthropic/nope-2`) advanced twice to the same answer. Residual: after exhausting the chain by rejections,
       `pendingResend` stays set until the next user message.
-- [ ] T9 Package name: unscoped `opencode-model-fallback` is taken on npm (likas21, v1.0.6, no repository). Scoped
-      `@javgsil/opencode-model-fallback` and GitHub `javgsil/opencode-model-fallback` are free. Pending user choice.
+- [x] T9 Rename (user choice). `opencode-model-fallback` was taken on npm, so the user chose
+      `opencode-auto-model-fallback` (free on npm and GitHub). Package name, repository URLs, README, lockfile root and
+      the log `service` renamed (commit `dcc3d16`); GitHub repo renamed to `javgsil/opencode-auto-model-fallback` and
+      the `origin` remote updated. Config file `agent-fallback.json` and env `OPENCODE_AGENT_FALLBACK_CONFIG` kept.
 
 ## Findings for the user
 
