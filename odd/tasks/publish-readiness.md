@@ -61,6 +61,17 @@ fallback answer had not been observed live.
       the log `service` renamed (commit `dcc3d16`); GitHub repo renamed to `javgsil/opencode-auto-model-fallback` and
       the `origin` remote updated. Config file `agent-fallback.json` and env `OPENCODE_AGENT_FALLBACK_CONFIG` kept.
 
+- [x] T10 `feat/pool-cooldown` was identical to `main` (`922a129`, 0 missing commits) and had no local copy; deleted on
+      the remote.
+- [x] T11 Publishing hardening (delegated writer): CI workflow, release workflow using npm trusted publishing (OIDC,
+      `npm stage publish`, SHA-pinned actions, minimal permissions), Dependabot for actions and bun, `SECURITY.md`, `publishConfig.access`. Action SHAs verified
+      via the GitHub API; workflows parse but have not run yet.
+- [x] T12 Professional README (delegated writer), claims checked against `src/`.
+- [ ] T13 User-side steps (cannot be automated): npm account with security-key 2FA, first manual publish, trusted
+      publisher, "Require 2FA and disallow tokens", GitHub tag ruleset, decide repo visibility (public enables provenance
+      and environment reviewers on the Free plan).
+- [ ] T14 Install in the user's opencode setups after publishing (needs consent for `~/.config/opencode`).
+
 ## Findings for the user
 
 - F1 (gap, fixed in T8): when opencode itself rejects the model (`ProviderModelNotFoundError`, e.g. a model id missing
