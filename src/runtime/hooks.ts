@@ -11,9 +11,12 @@
  *
  * State machine per session (one user request at a time):
  * - `chat.message` (genuine) starts a request: captures the resendable user
- *   parts, the request's user message ids, and the agent/variant; only the
- *   message carrying the id passed to `promptAsync` counts as this plugin's
- *   resend echo, and it only contributes its user message id.
+ *   parts, the request's user message ids, and the identity of the resolved
+ *   model, so a `session.error` can be attributed to this request before
+ *   `chat.params` runs; only the message carrying the id passed to
+ *   `promptAsync` counts as this plugin's resend echo, and it contributes its
+ *   user message ids plus the resend target's identity while that resend is
+ *   still pending.
  * - `chat.params` records the model actually being used and clears the resend
  *   marker set by this plugin's own echo, but only when the params answer a
  *   message of the live request: a late params call for a superseded resend or
@@ -21,7 +24,11 @@
  * - `message.updated` failures (correlated to the live request through the
  *   assistant message's parent user message) and delayed `session.error` events
  *   walk the chain once per request via `selectNextEntry`, resending the
- *   original user parts with the next configured model.
+ *   original user parts with the next configured model. A `session.error` whose
+ *   text names the live model as opencode's own registry rejection
+ *   (`Model not found: <provider>/<model>.`) bypasses the pending-resend guard
+ *   and twin suppression: opencode publishes it before `chat.params`, so the
+ *   rejection of a resend target would otherwise stall the chain.
  *
  * Hooks never throw: every entry point is wrapped so a plugin defect cannot
  * break the host.
@@ -38,6 +45,7 @@ import { createLogger, type Logger } from './log'
 import { createTaskGuard } from './task-guard'
 
 type Client = Parameters<Plugin>[0]['client']
+type ChatMessageInput = Parameters<NonNullable<Hooks['chat.message']>>[0]
 type ChatMessageOutput = Parameters<NonNullable<Hooks['chat.message']>>[1]
 type ChatParamsInput = Parameters<NonNullable<Hooks['chat.params']>>[0]
 type ConfigHookInput = Parameters<NonNullable<Hooks['config']>>[0]
@@ -172,6 +180,37 @@ function withTimeout<T>(promise: PromiseLike<T>, ms: number): Promise<T> {
 function modelIDFor(providerID: string, id: string): string {
 	const prefix = `${providerID}/`
 	return id.startsWith(prefix) ? id.slice(prefix.length) : id
+}
+
+/**
+ * The live identity a `chat.message` establishes for its user message: the agent plus the
+ * resolved model opencode's run loop looks up next (`getModel` runs on exactly this pair,
+ * before `chat.params`). Seeding here is what lets a `session.error` be attributed to this
+ * request without waiting for `chat.params` — including opencode's own registry rejection
+ * `Model not found: ...`, which the run loop publishes for a model that never reaches
+ * `chat.params` at all.
+ */
+function identityFromChatMessage(input: ChatMessageInput, output: ChatMessageOutput): Identity {
+	const model = input.model ?? output.message.model
+	return {
+		agent: input.agent ?? output.message.agent,
+		providerID: model.providerID,
+		modelID: modelIDFor(model.providerID, model.modelID),
+		// `input.variant` is the declared source; the installed SDK type omits the `variant`
+		// the user message carries at runtime, so it is read defensively from the message.
+		variant: input.variant ?? readString(output.message.model, 'variant')
+	}
+}
+
+/**
+ * Whether a `session.error` message is opencode's own registry rejection of exactly the
+ * model the session is running: its run loop publishes `Model not found: <provider>/<model>.`
+ * (plus an optional suggestion) after `chat.message` and before `chat.params`, so the
+ * embedded ids are the only signal tying the failure to that model. The whole pair is one
+ * prefix, which keeps model ids containing dots exact.
+ */
+function rejectsLiveModel(message: string | undefined, providerID: string, modelID: string): boolean {
+	return message !== undefined && message.startsWith(`Model not found: ${providerID}/${modelID}.`)
 }
 
 function identityEntry(identity: { providerID: string; modelID: string; variant?: string }): ChainEntry {
@@ -552,7 +591,16 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 					const state = getState(sessionID)
 					const { agent, providerID, modelID, variant } = state.identity
 					if (agent === undefined || providerID === undefined || modelID === undefined) return
-					if (state.pendingResend) return
+					// opencode rejects an unknown model id in its own run loop, after `chat.message`
+					// and before `chat.params`, so when this plugin's resend target is rejected that
+					// way `pendingResend` still guards the resend and the previous failure's twin
+					// window still holds. The rejected ids embedded in the message name the model the
+					// session is running, which proves this failure belongs to the resend target and
+					// not to the run it replaced: only that exact match may bypass both guards. Every
+					// other error keeps them, so a late error or host retry of the replaced run stays
+					// ignored while the resend settles.
+					const rejectedLive = rejectsLiveModel(details.message, providerID, modelID)
+					if (state.pendingResend && !rejectedLive) return
 					const now = Date.now()
 					// Twin suppression is evidence-gated, not time-only. Inside the window a
 					// `session.error` is the same failure when it names the identity that just
@@ -572,7 +620,7 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 						now - state.lastFailureAt <= TWIN_FAILURE_SLACK_MS &&
 						state.lastFailureIdentity !== undefined &&
 						(sameIdentity(state.lastFailureIdentity, state.identity) || !liveRan)
-					if (twin) return
+					if (twin && !rejectedLive) return
 					state.lastFailureAt = now
 					state.lastFailureIdentity = { agent, providerID, modelID, variant }
 					cancelErrorTimer(state)
@@ -582,7 +630,11 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 					const requestSeq = state.requestSeq
 					state.errorTimer = setTimeout(() => {
 						state.errorTimer = undefined
-						if (disposed || state.pendingResend) return
+						if (disposed) return
+						// The rejected resend is still the live identity here, so its own rejection may
+						// fire even though `pendingResend` is still set; every other delayed failure
+						// keeps the guard.
+						if (state.pendingResend && !rejectedLive) return
 						if (state.requestSeq !== requestSeq) return
 						if (!sameIdentity(state.identity, snapshot)) return
 						void processFailure(sessionID, snapshot)
@@ -678,11 +730,19 @@ export async function createHooks(deps: RuntimeDeps): Promise<Hooks> {
 				if (isEcho) {
 					if (state.pendingResend) {
 						for (const id of userIDs) state.requestUserIDs.add(id)
+						// The echo is the user message this plugin's own resend created, so its model IS
+						// the resend target: record it as the live identity right away. `chat.params`
+						// never fires when opencode's registry rejects that target, and `promptAsync`
+						// may not have resolved yet, so without this seed the rejection would be
+						// attributed to the previous model and the chain would stall. Only the echo of
+						// the still-pending resend may write: a stale echo of a superseded one must not
+						// touch the identity a newer request owns.
+						state.identity = identityFromChatMessage(input, output)
 					}
 					return
 				}
 				cancelErrorTimer(state)
-				state.identity = { agent: input.agent ?? output.message.agent, variant: input.variant }
+				state.identity = identityFromChatMessage(input, output)
 				state.parts = mapResendParts(output.parts)
 				state.failed = []
 				state.attempted = []

@@ -288,8 +288,18 @@ async function emitResendEcho(
 	index: number,
 	text = 'hello'
 ): Promise<void> {
+	const body = prompts[index]?.body
+	const model = body?.model as { providerID: string; modelID: string } | undefined
+	if (model === undefined) throw new Error(`resend ${index} carries no model`)
+	// opencode replays the prompt input as the `chat.message` input, so the echo carries the
+	// resend's agent, model and variant exactly as this plugin sent them.
 	await hooks['chat.message']!(
-		{ sessionID },
+		{
+			sessionID,
+			agent: typeof body?.agent === 'string' ? body.agent : undefined,
+			model,
+			variant: typeof body?.variant === 'string' ? body.variant : undefined
+		},
 		{ message: userMessage(sessionID, resendMessageID(prompts, index)), parts: [textPart(sessionID, text)] }
 	)
 }
@@ -689,12 +699,8 @@ describe('session.error correlation', () => {
 		expect(prompts).toHaveLength(0)
 	})
 
-	test('ignores session.error without a captured identity', async () => {
+	test('ignores session.error before any chat.message captured an identity', async () => {
 		const { hooks, prompts } = await makeHooks({ sessionErrorGraceMs: 5 })
-		await hooks['chat.message']!(
-			{ sessionID: 's1', agent: 'coder' },
-			{ message: userMessage('s1'), parts: [textPart('s1', 'hi')] }
-		)
 		await hooks.event!({
 			event: {
 				type: 'session.error',
@@ -794,6 +800,134 @@ describe('session.error correlation', () => {
 			}
 		})
 		await sleep(25)
+		expect(prompts).toHaveLength(1)
+	})
+})
+
+describe('opencode-side model rejection', () => {
+	/** The `session.error` opencode 1.18.34 publishes when its own registry has no such model. */
+	const modelNotFound = (providerID: string, modelID: string) => ({
+		name: 'UnknownError' as const,
+		data: { message: `Model not found: ${providerID}/${modelID}.` }
+	})
+
+	/**
+	 * A request opencode rejects in its own run loop: `chat.message` fires, then `getModel`
+	 * dies, so `chat.params` never runs and only `session.error` reaches the plugin.
+	 */
+	async function emitRejectedRequest(hooks: Hooks, sessionID: string, modelID: string): Promise<void> {
+		await hooks['chat.message']!(
+			{ sessionID, agent: 'coder', model: { providerID: 'prov', modelID } },
+			{ message: userMessage(sessionID), parts: [textPart(sessionID, 'hello')] }
+		)
+		await hooks.event!({
+			event: { type: 'session.error', properties: { sessionID, error: modelNotFound('prov', modelID) } }
+		})
+		await sleep(25)
+	}
+
+	test('resends to the next chain entry when opencode rejects the requested model', async () => {
+		// A registry miss cools the rejected model's whole pool (pool-unavailable), so the
+		// next entry has to live in another pool — as a real cross-provider chain does.
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"agents":{"coder":["prov/c1","other/c2"]}}',
+			sessionErrorGraceMs: 5
+		})
+		await emitRejectedRequest(hooks, 's1', 'c1')
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.agent).toBe('coder')
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'other', modelID: 'c2' })
+		expect(prompts[0]?.body?.parts).toEqual([{ type: 'text', text: 'hello' }])
+	})
+
+	test('seeds the identity from the user message model when chat.message carries no model', async () => {
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"default":["prov/m9","other/m2"]}',
+			sessionErrorGraceMs: 5
+		})
+		await hooks['chat.message']!(
+			{ sessionID: 's1', agent: 'coder' },
+			{
+				message: { ...userMessage('s1'), model: { providerID: 'prov', modelID: 'm9' } },
+				parts: [textPart('s1', 'hello')]
+			}
+		)
+		await hooks.event!({
+			event: { type: 'session.error', properties: { sessionID: 's1', error: modelNotFound('prov', 'm9') } }
+		})
+		await sleep(25)
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'other', modelID: 'm2' })
+	})
+
+	test('advances a second time when opencode also rejects the resend target', async () => {
+		const { hooks, prompts } = await makeHooks({
+			configJson: '{"agents":{"coder":["prov/c1","other/c2","third/c3"]}}',
+			sessionErrorGraceMs: 5
+		})
+		await emitRejectedRequest(hooks, 's1', 'c1')
+		expect(prompts).toHaveLength(1)
+		expect(prompts[0]?.body?.model).toEqual({ providerID: 'other', modelID: 'c2' })
+
+		// The resend's echo establishes the resend target; `chat.params` never does, because
+		// opencode rejects c2 in its run loop before params run for it.
+		await emitResendEcho(hooks, 's1', prompts, 0)
+		await hooks.event!({
+			event: { type: 'session.error', properties: { sessionID: 's1', error: modelNotFound('other', 'c2') } }
+		})
+		await sleep(25)
+		expect(prompts).toHaveLength(2)
+		expect(prompts[1]?.body?.model).toEqual({ providerID: 'third', modelID: 'c3' })
+	})
+
+	test('logs exhaustion once when opencode rejects the last chain entry', async () => {
+		const { hooks, prompts, logCalls } = await makeHooks({
+			configJson: '{"agents":{"coder":["prov/c1","other/c2"]}}',
+			sessionErrorGraceMs: 5
+		})
+		await emitRejectedRequest(hooks, 's1', 'c1')
+		expect(prompts).toHaveLength(1)
+
+		await emitResendEcho(hooks, 's1', prompts, 0)
+		await hooks.event!({
+			event: { type: 'session.error', properties: { sessionID: 's1', error: modelNotFound('other', 'c2') } }
+		})
+		await sleep(25)
+		expect(prompts).toHaveLength(1)
+		const exhaustion = logCalls.filter((body) => String(body.message).includes('exhausted'))
+		expect(exhaustion).toHaveLength(1)
+		expect(exhaustion[0]?.level).toBe('warn')
+	})
+
+	test('keeps ignoring the aborted run while a resend is pending', async () => {
+		const { hooks, prompts, aborts } = await makeHooks({
+			configJson: '{"default":["go/a","zen/c"]}',
+			sessionErrorGraceMs: 5
+		})
+		await captureRequest(hooks, 's1', 'coder', 'go', 'a')
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		expect(aborts).toEqual(['s1'])
+		expect(prompts).toHaveLength(1)
+
+		// The aborted run's own session.error, before the resend's chat.params...
+		await hooks.event!({
+			event: {
+				type: 'session.error',
+				properties: {
+					sessionID: 's1',
+					error: { name: 'APIError', data: { message: 'rate limit', statusCode: 429, isRetryable: true } }
+				}
+			}
+		})
+		// ...the host retries it...
+		await emitRetry(hooks, 's1', GLOBAL_REGIONS)
+		// ...and a model rejection naming the model the resend left behind: none of them may
+		// act on the fresh generation while the resend is still pending.
+		await hooks.event!({
+			event: { type: 'session.error', properties: { sessionID: 's1', error: modelNotFound('go', 'a') } }
+		})
+		await sleep(25)
+		expect(aborts).toEqual(['s1'])
 		expect(prompts).toHaveLength(1)
 	})
 })
