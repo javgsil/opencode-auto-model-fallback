@@ -27,16 +27,40 @@ fallback answer had not been observed live.
 - [x] T1 Rewrite commit identity to the personal account (inline). All 8 commits now use
       `javiergonzalezsilva@gmail.com`; `main` and `feat/pool-cooldown` force-pushed to `922a129`. Backup bundle:
       `~/dev/backups/opencode-agent-fallback-pre-rewrite.bundle`. No `alegra` reference remains in files or messages.
-- [ ] T2 `package.json`: add `repository`, `homepage`, `bugs` for `javgsil/opencode-agent-fallback` (inline,
-      mechanical). Unscoped name `opencode-agent-fallback` is free on npm; keep it unless the user wants a scope.
-- [ ] T3 T4-F4: test the production `defaultSleep` (resolve + abort/clearTimeout path) directly (test-first).
-- [ ] T4 Packaging: `npm pack --dry-run`; verify opencode 1.18.34 loads the packed package as an npm plugin in an
-      isolated environment (temp XDG dirs, no `~/.config/opencode` changes) (delegated).
-- [ ] T5 Investigate "background dependency install failed ... unable to resolve dependency tree" in
-      `~/.config/opencode` (read-only) (delegated).
-- [ ] T6 Live validation through `opencode serve` + SDK: an opencode-go model must end with an answer from the fallback
-      model (delegated).
-- [ ] T7 README with install and config docs.
+- [x] T2 `package.json`: add `author`, `repository`, `homepage`, `bugs` for `javgsil/opencode-agent-fallback` (inline,
+      mechanical). Unscoped name `opencode-agent-fallback` is free on npm; kept unless the user wants a scope. Commit
+      `a3851b7`.
+- [x] T3 T4-F4: test the production `defaultSleep` directly (inline, test-first). `defaultSleep` is now exported; four
+      direct tests (plain delay, pre-aborted signal arms no timer, abort clears the pending timer, listener detached after
+      firing); the deadline-release test uses the production function instead of a copy. RED: `Export named
+    'defaultSleep' not found`; GREEN: 26/26; mutation (drop `clearTimeout`) fails the clear test. Commit `21000e5`.
+- [x] T4 Packaging (delegated, isolated). `npm pack --dry-run`: 12 files, 25.0 kB, no warnings (13 files / 26.6 kB
+      with README). Published only to a localhost verdaccio with temp XDG dirs; opencode 1.18.34 installed it with npm
+      into `$XDG_CACHE_HOME/opencode/packages/opencode-agent-fallback@0.2.0/` and loaded the TS source (the plugin's
+      own invalid-config log line appeared; negative control without the env var showed none). The optional peer
+      `@opencode-ai/plugin` is not installed there. No package.json change needed.
+- [x] T5 Dependency-install failure (delegated, read-only). Does not occur on this machine (0 log hits). opencode runs
+      npm in `~/.config/opencode`, whose `package.json` and `package-lock.json` are out of sync; a dry-run install on a
+      copy resolves cleanly today. Plugin installs use a separate npm project per plugin in the cache dir, so this
+      failure does not block installing the package.
+- [x] T6 Live validation (delegated) via `opencode serve` + HTTP from a temp project loading the plugin from
+      `.opencode/plugins/`. A local stub provider returning 403 "not available in your region" drove the failure: log
+      `falling back for session ...: opencode/mimo-v2.6-flash-free`, final assistant text `PONG` from the fallback model,
+      agent stayed `build`. A second session skipped the cooling pool and went straight to the fallback. Phantom
+      Task-cancel recovery was not exercised. Note: this machine has no `opencode-go` region error to reproduce, so the
+      real opencode-go path is still unobserved here.
+- [x] T7 README with install and config docs (inline).
+
+## Findings for the user
+
+- F1 (gap, not fixed): when opencode itself rejects the model (`ProviderModelNotFoundError`, e.g. a model id missing
+  from its registry), only `session.error` fires, before `chat.params`, so the plugin has no identity and silently
+  skips fallback (`src/runtime/hooks.ts` identity guard). Provider-returned "model not found" errors do fall back.
+  Fixing it means deriving identity from the user message; a product decision, left for the user.
+- F2 (false alarm): opencode calls every exported function of a plugin module, but 1.18.34 dedupes identical function
+  references (`packages/opencode/src/plugin/index.ts`, `seen` set), and `src/index.ts` exports the same reference as
+  named and default, so it registers once. Only a wrapper exporting two distinct functions would double-register.
+- F3 (optional): bound the peer range, e.g. `>=1.18.34 <2`.
 
 ## Blocked on the user
 
@@ -44,5 +68,8 @@ fallback answer had not been observed live.
 - Per-machine install: editing `~/.config/opencode/opencode.json` and removing the local loader needs consent.
 
 ## Progress / evidence
+
+- Checks: `bun run check` exit 0 (165 tests, tsc, prettier, eslint) after T3 and T7.
+- RDD: assess over `922a129..21000e5` = medium, `review_due: false` (`under_budget`).
 
 - T1: `git log --all --format='%ae%n%ce' | sort | uniq -c` -> `16 javiergonzalezsilva@gmail.com`.
