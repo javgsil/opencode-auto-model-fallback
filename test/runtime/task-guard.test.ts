@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
-import { createTaskGuard, type TaskGuardOptions } from '../../src/runtime/task-guard'
+import { createTaskGuard, defaultSleep, type TaskGuardOptions } from '../../src/runtime/task-guard'
 import type { Logger } from '../../src/runtime/log'
 
 type Client = Parameters<Plugin>[0]['client']
@@ -470,26 +470,78 @@ describe('task guard: failure paths', () => {
 	})
 })
 
-describe('task guard: deadline timer release', () => {
-	/** A real, abortable sleep mirroring the default implementation. */
-	function realSleep(ms: number, signal?: AbortSignal): Promise<void> {
-		return new Promise((resolve) => {
-			if (signal?.aborted) {
-				resolve()
-				return
+describe('task guard: default sleep', () => {
+	/** Records every timer handle the production sleep arms and clears. */
+	function trackTimers(): { armed: unknown[]; cleared: unknown[]; restore: () => void } {
+		const armed: unknown[] = []
+		const cleared: unknown[] = []
+		const realSetTimeout = globalThis.setTimeout
+		const realClearTimeout = globalThis.clearTimeout
+		globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+			const timer = realSetTimeout(handler, ms)
+			armed.push(timer)
+			return timer
+		}) as typeof setTimeout
+		globalThis.clearTimeout = ((timer?: Parameters<typeof clearTimeout>[0]) => {
+			cleared.push(timer)
+			realClearTimeout(timer)
+		}) as typeof clearTimeout
+		return {
+			armed,
+			cleared,
+			restore: () => {
+				globalThis.setTimeout = realSetTimeout
+				globalThis.clearTimeout = realClearTimeout
 			}
-			const timer = setTimeout(() => {
-				signal?.removeEventListener('abort', release)
-				resolve()
-			}, ms)
-			function release(): void {
-				clearTimeout(timer)
-				resolve()
-			}
-			signal?.addEventListener('abort', release, { once: true })
-		})
+		}
 	}
 
+	test('resolves after the requested delay without a signal', async () => {
+		const started = Date.now()
+		await defaultSleep(20)
+		expect(Date.now() - started).toBeGreaterThanOrEqual(15)
+	})
+
+	test('resolves at once and arms no timer when the signal is already aborted', async () => {
+		const timers = trackTimers()
+		try {
+			const controller = new AbortController()
+			controller.abort()
+			await defaultSleep(60000, controller.signal)
+			expect(timers.armed).toHaveLength(0)
+		} finally {
+			timers.restore()
+		}
+	})
+
+	test('clears its pending timer as soon as the signal aborts', async () => {
+		const timers = trackTimers()
+		try {
+			const controller = new AbortController()
+			const sleeping = defaultSleep(60000, controller.signal)
+			expect(timers.armed).toHaveLength(1)
+			controller.abort()
+			await sleeping
+			expect(timers.cleared).toEqual(timers.armed)
+		} finally {
+			timers.restore()
+		}
+	}, 2000)
+
+	test('detaches its abort listener once the timer fires', async () => {
+		const controller = new AbortController()
+		const removed: string[] = []
+		const realRemove = controller.signal.removeEventListener.bind(controller.signal)
+		controller.signal.removeEventListener = ((type: string, listener: EventListener) => {
+			removed.push(type)
+			realRemove(type, listener)
+		}) as typeof controller.signal.removeEventListener
+		await defaultSleep(5, controller.signal)
+		expect(removed).toEqual(['abort'])
+	})
+})
+
+describe('task guard: deadline timer release', () => {
 	const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 	test('releases the losing deadline timer of an asynchronously winning call', async () => {
@@ -497,7 +549,7 @@ describe('task guard: deadline timer release', () => {
 		const requestSignals: AbortSignal[] = []
 		const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
 			if (signal !== undefined) timerSignals.push(signal)
-			return realSleep(ms, signal)
+			return defaultSleep(ms, signal)
 		}
 		// Real timers on both sides: every client call settles only after a 5ms
 		// `setTimeout`, well past the SETTLE_YIELD microtask turns, so `withDeadline`

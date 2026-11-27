@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-agent-fallback",
+      "name": "opencode-auto-model-fallback",
       "devDependencies": {
         "@eslint/js": "^9.39.5",
         "@opencode-ai/plugin": "1.18.34",

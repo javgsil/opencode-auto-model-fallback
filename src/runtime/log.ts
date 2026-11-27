@@ -9,7 +9,7 @@ import type { Plugin } from '@opencode-ai/plugin'
 type Client = Parameters<Plugin>[0]['client']
 
 /** Service name attached to every log entry this plugin writes. */
-export const LOG_SERVICE = 'opencode-agent-fallback'
+export const LOG_SERVICE = 'opencode-auto-model-fallback'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 

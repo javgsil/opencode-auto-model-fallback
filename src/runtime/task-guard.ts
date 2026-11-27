@@ -240,7 +240,7 @@ function explainError(outcome: Extract<TaskGuardOutcome, { kind: 'explained' }>)
  * its scope signal aborts, so a deadline timer that lost its race leaves no pending timer
  * behind (review R3-losing-deadline-timers).
  */
-function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+export function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve) => {
 		if (signal?.aborted) {
 			resolve()

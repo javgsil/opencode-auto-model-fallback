@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Only the publish job adds `id-token: write`, for npm trusted publishing (OIDC).
+permissions:
+  contents: read
+
+# One run per tag and never cancelled: a shared group would let a newer pending tag evict an
+# older pending one, so that version would silently never be staged.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: bun run check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Run checks
+        run: bun run check
+
+  publish:
+    name: Publish to npm
+    # Dev dependencies run only in `check`, which has no OIDC permission: a compromised
+    # dev dependency can never request an npm publish token. This job installs nothing.
+    needs: check
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Verify tag matches package.json version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}." >&2
+            exit 1
+          fi
+      - name: Install pinned npm
+        # npm >= 11.15.0 is required for staged publishing with trusted publishers.
+        run: npm install --global npm@11.21.0
+      - name: Publish to npm (staged)
+        # Trusted publishing (OIDC): no npm token is stored in this repository. Trusted
+        # publishers created after 2026-09-03 may only run `npm stage publish`, so the
+        # owner approves the staged version afterwards with `npm stage approve <stage-id>`
+        # plus 2FA. Switching this step to `npm publish` requires allowing that command
+        # on the trusted publisher in npm package settings first.
+        run: npm stage publish
