@@ -1,0 +1,139 @@
+name: Bug report
+description: Report unexpected behavior in the OpenCode model fallback plugin.
+title: "[Bug] "
+labels: ["bug"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report one problem per issue. Before submitting, search open and closed
+        issues for the same behavior.
+
+        **This report is public.** Do not include API keys, authorization headers,
+        account IDs, private repository names, absolute paths, or conversation
+        content. Share only the relevant, redacted configuration and log lines.
+
+  - type: textarea
+    id: observed_behavior
+    attributes:
+      label: What happened?
+      description: Describe the visible failure and its impact. Include the exact error text if it is safe to share.
+      placeholder: "The subagent stopped after HTTP 402. No backup model appeared in the session history."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: What did you expect to happen?
+      description: State the observable result you expected, including which model should run next if known.
+      placeholder: "The plugin should try the next available model from a different quota pool."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Steps to reproduce
+      description: Use a minimal prompt and a disposable workspace. If the failure was intermittent, list the steps from the occurrence you observed.
+      placeholder: |
+        1. Enable the plugin with the fallback chain shown below.
+        2. Start a fresh or resumed session and invoke the affected agent.
+        3. Record the initial model, the provider error, and any model attempted afterward.
+    validations:
+      required: true
+
+  - type: input
+    id: opencode_version
+    attributes:
+      label: OpenCode version
+      description: Paste the output of `opencode --version`.
+      placeholder: "1.19.0"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version or commit
+      description: Provide the installed version, Git tag, or commit SHA. If you cannot determine it, enter `unknown`.
+      placeholder: "v0.2.0 or a short commit SHA"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Diagnostic details
+        Fill in the fields relevant to your report. Leave anything you did not
+        observe blank rather than guessing.
+
+  - type: dropdown
+    id: session_type
+    attributes:
+      label: Where did it happen?
+      options:
+        - Primary agent
+        - Subagent
+        - Both
+        - Plugin startup or configuration
+        - Not sure
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time with these steps
+        - Intermittently
+        - Observed once
+        - Not sure
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and installation
+      description: Include OS and architecture, OpenCode interface, installation method, and whether the plugin is loaded globally or per project.
+      placeholder: "Linux x86_64; OpenCode TUI; plugin loaded globally from a local checkout."
+
+  - type: textarea
+    id: fallback_routing
+    attributes:
+      label: Model routing and attempts
+      description: List public provider and model IDs, variants, and quota pool mappings if known. Distinguish configured models from observed attempts.
+      placeholder: |
+        Agent or anonymized alias:
+        Fresh or resumed session:
+        Initial model actually used:
+        Configured fallback chain, in order:
+        Quota pools, if known:
+        Models observed after the failure, in order:
+
+  - type: textarea
+    id: minimal_config
+    attributes:
+      label: Minimal redacted configuration
+      description: Paste only the relevant `agent-fallback.json` entries. Include pool mappings or cooldown settings only if they affect the reproduction.
+      render: json
+
+  - type: textarea
+    id: diagnostic_logs
+    attributes:
+      label: Relevant error or log excerpt
+      description: Include only a few surrounding lines. Preserve the status code, error message, and retryability flag if available. Remove headers, session IDs, and account identifiers.
+      render: text
+
+  - type: input
+    id: last_known_working
+    attributes:
+      label: Last known working version
+      description: If this is a regression, provide the last OpenCode and plugin versions where the same setup worked.
+      placeholder: "OpenCode <version>; plugin <version or commit>"
+
+  - type: textarea
+    id: workaround_and_context
+    attributes:
+      label: Workaround and additional context
+      description: Note what you already tried, whether it changed the outcome, and any related public issue or minimal reproduction link.
+      placeholder: "Manually selecting the backup model worked, but automatic fallback still did not run."
